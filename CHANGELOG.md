@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.2-test
+
+- Fixed Home Assistant WebSocket HTTP 400 during upgrade by using a valid 16-byte `Sec-WebSocket-Key`.
+- Kept v0.4.1 diagnostics for the next Assist pipeline test.
+
 ## v0.4.1-test
 
 - Added detailed Home Assistant WebSocket diagnostics:
