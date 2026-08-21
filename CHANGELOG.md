@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0-test
+
+- Added first ES8311/ES7210 audio init layer.
+- Added shared I2S RX/TX setup at 16 kHz / 16-bit stereo.
+- Added web UI mic-level meter.
+- Added speaker test tone endpoint and button.
+- Kept this as a test build; no stable tag yet.
+
 ## v0.2.2
 
 - Added onboard button handling:
@@ -21,4 +29,3 @@
   - ES7210 at 0x40
   - TCA9555 at 0x20
   - PCF85063 RTC at 0x51
-
