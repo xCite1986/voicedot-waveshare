@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.0-test
+
+- Added K2 short press as wake/record trigger.
+- Changed K2 long press to mute toggle.
+- Added a 3.5 second 16 kHz PCM recording buffer in PSRAM.
+- Added first Home Assistant Assist WebSocket pipeline sender.
+- Added Assist diagnostics in the web UI.
+
 ## v0.3.1
 
 - Promoted the working v0.3 audio bring-up to stable.
