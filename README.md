@@ -40,6 +40,7 @@ Adafruit NeoPixel
 - `VoiceDot_Waveshare_v0_4_1`: adds detailed diagnostics for Home Assistant WebSocket/auth failures.
 - `VoiceDot_Waveshare_v0_4_2`: fixes HA WebSocket HTTP 400 upgrade error.
 - `VoiceDot_Waveshare_v0_4_3`: parses Assist events, shows assistant/TTS diagnostics, and plays WAV/PCM16 TTS audio over ES8311.
+- `VoiceDot_Waveshare_v0_4_4`: compile fix for Arduino-ESP32 Core 3.3.8 TTS stream reading.
 
 ## Button Mapping
 
@@ -73,7 +74,7 @@ or the IP shown in the serial monitor.
 
 ## Current Test Milestone
 
-`v0.4.3-test` records a short PCM sample after K2 short press or the web UI wake button,
+`v0.4.4-test` records a short PCM sample after K2 short press or the web UI wake button,
 sends it to the Home Assistant Assist pipeline over WebSocket, then fetches and plays
 Home Assistant TTS when the returned media is WAV/PCM16. Compressed formats such as
 MP3/Opus are shown in the diagnostics and need a decoder in a later build.

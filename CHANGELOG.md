@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.4-test
+
+- Fixed Arduino-ESP32 Core 3.3.8 compile error in TTS stream reading by using `Stream::readBytes`.
+- Replaced deprecated legacy I2S DMA field aliases with `dma_desc_num` and `dma_frame_num`.
+
 ## v0.4.3-test
 
 - Added structured Home Assistant Assist event handling for `stt-end`, `intent-progress`, `intent-end`, `tts-end`, and `run-end`.
