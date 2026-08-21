@@ -37,6 +37,7 @@ Adafruit NeoPixel
 - `VoiceDot_Waveshare_v0_2_2`: adds onboard button handling.
 - `VoiceDot_Waveshare_v0_3_1`: stable local audio bring-up with microphone level and speaker test.
 - `VoiceDot_Waveshare_v0_4_0`: test build for K2 wake recording and Home Assistant Assist pipeline upload.
+- `VoiceDot_Waveshare_v0_4_1`: adds detailed diagnostics for Home Assistant WebSocket/auth failures.
 
 ## Button Mapping
 

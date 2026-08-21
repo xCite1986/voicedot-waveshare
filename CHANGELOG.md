@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.1-test
+
+- Added detailed Home Assistant WebSocket diagnostics:
+  connect, HTTP upgrade, auth-required, auth, pipeline start, audio upload.
+- Removed the WebSocket Origin header for better compatibility with local HA/proxy setups.
+- Kept K2 short wake and K2 long mute behavior from v0.4.0-test.
+
 ## v0.4.0-test
 
 - Added K2 short press as wake/record trigger.
