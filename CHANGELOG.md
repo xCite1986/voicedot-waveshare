@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.3-test
+
+- Added structured Home Assistant Assist event handling for `stt-end`, `intent-progress`, `intent-end`, `tts-end`, and `run-end`.
+- Added assistant response text and TTS playback status to the web UI diagnostics.
+- Added first TTS fetch/playback path: Home Assistant TTS URLs are requested with the stored token and WAV/PCM16 mono/stereo is played over ES8311.
+- Unsupported compressed TTS formats such as MP3/Opus are reported clearly for the next decoder step.
+
 ## v0.4.2-test
 
 - Fixed Home Assistant WebSocket HTTP 400 during upgrade by using a valid 16-byte `Sec-WebSocket-Key`.

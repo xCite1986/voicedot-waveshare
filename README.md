@@ -39,10 +39,11 @@ Adafruit NeoPixel
 - `VoiceDot_Waveshare_v0_4_0`: test build for K2 wake recording and Home Assistant Assist pipeline upload.
 - `VoiceDot_Waveshare_v0_4_1`: adds detailed diagnostics for Home Assistant WebSocket/auth failures.
 - `VoiceDot_Waveshare_v0_4_2`: fixes HA WebSocket HTTP 400 upgrade error.
+- `VoiceDot_Waveshare_v0_4_3`: parses Assist events, shows assistant/TTS diagnostics, and plays WAV/PCM16 TTS audio over ES8311.
 
 ## Button Mapping
 
-For `v0.4.0-test`:
+For `v0.4.x-test`:
 
 ```text
 K1 / EXIO09  Volume up
@@ -72,5 +73,7 @@ or the IP shown in the serial monitor.
 
 ## Current Test Milestone
 
-`v0.4.0-test` records a short PCM sample after K2 short press or the web UI wake button,
-then sends it to the Home Assistant Assist pipeline over WebSocket.
+`v0.4.3-test` records a short PCM sample after K2 short press or the web UI wake button,
+sends it to the Home Assistant Assist pipeline over WebSocket, then fetches and plays
+Home Assistant TTS when the returned media is WAV/PCM16. Compressed formats such as
+MP3/Opus are shown in the diagnostics and need a decoder in a later build.
