@@ -1,0 +1,10 @@
+/arduino-build-v*/
+/sources/
+/VoiceDot_Waveshare_v*.ino
+*.bin
+*.elf
+*.map
+*.hex
+*.tmp
+*.log
+
