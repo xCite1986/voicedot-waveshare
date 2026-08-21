@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.1
+
+- Promoted the working v0.3 audio bring-up to stable.
+- Fixed ES7210 microphone start clock handling.
+- Added RX diagnostics for microphone reads, byte count, silent frames, and errors.
+- Verified on device: speaker test works and microphone level responds.
+
 ## v0.3.0-test
 
 - Added first ES8311/ES7210 audio init layer.
