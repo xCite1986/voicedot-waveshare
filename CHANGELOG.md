@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.5-test
+
+- Added first MP3 TTS playback path using the Arduino `ESP8266Audio` library.
+- Added a Home Assistant authenticated MP3 stream source and direct ES8311/I2S output adapter.
+- WAV/PCM16 playback remains available; MP3 from `/api/tts_proxy/*.mp3` should now be decoded locally.
+
 ## v0.4.4-test
 
 - Fixed Arduino-ESP32 Core 3.3.8 compile error in TTS stream reading by using `Stream::readBytes`.
