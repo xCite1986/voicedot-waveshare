@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.11-test
+
+- Disabled the `ESP8266Audio` MP3 decoder path because it loads the new I2S driver, which conflicts with the firmware's current legacy I2S driver on Arduino-ESP32 Core 3.3.8.
+- Keeps Assist/STT/TTS diagnostics and WAV playback stable while avoiding the boot reset loop.
+
 ## v0.4.10-test
 
 - Replaced the broad `ESP8266Audio.h` aggregate include with the four specific MP3 decoder headers again.

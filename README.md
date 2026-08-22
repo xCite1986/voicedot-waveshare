@@ -29,7 +29,6 @@ Install this Arduino library:
 
 ```text
 Adafruit NeoPixel
-ESP8266Audio
 ```
 
 ## Firmware Versions
@@ -48,6 +47,7 @@ ESP8266Audio
 - `VoiceDot_Waveshare_v0_4_8`: uses normal `ESP8266Audio` includes so Arduino IDE detects the installed MP3 library.
 - `VoiceDot_Waveshare_v0_4_9`: uses the official `ESP8266Audio.h` aggregate header for Arduino IDE library detection.
 - `VoiceDot_Waveshare_v0_4_10`: narrows ESP8266Audio includes again and adds early boot breadcrumbs.
+- `VoiceDot_Waveshare_v0_4_11`: disables ESP8266Audio MP3 playback to avoid the new-vs-legacy I2S driver boot conflict.
 
 ## Button Mapping
 
@@ -81,7 +81,7 @@ or the IP shown in the serial monitor.
 
 ## Current Test Milestone
 
-`v0.4.10-test` records a short PCM sample after K2 short press or the web UI wake button,
+`v0.4.11-test` records a short PCM sample after K2 short press or the web UI wake button,
 sends it to the Home Assistant Assist pipeline over WebSocket, then fetches and plays
-Home Assistant TTS when the returned media is WAV/PCM16 or MP3. Ogg/Opus is shown in
-the diagnostics and needs a later decoder step.
+Home Assistant TTS when the returned media is WAV/PCM16. MP3 is reported in diagnostics
+until the audio stack is moved fully to the new I2S driver or HA returns WAV.
