@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.0-test
+
+- Migrated the firmware audio layer from the deprecated legacy I2S driver to the new ESP-IDF I2S STD channel driver.
+- Re-enabled the ESP8266Audio MP3 decoder path on top of the new I2S base.
+- Added new TX/RX channel wrappers for microphone reads, speaker writes, WAV playback, and MP3 decoder output.
+- This is a larger audio-stack test build; verify boot, mic level, speaker test, wake recording, and MP3 TTS in that order.
+
 ## v0.4.11-test
 
 - Disabled the `ESP8266Audio` MP3 decoder path because it loads the new I2S driver, which conflicts with the firmware's current legacy I2S driver on Arduino-ESP32 Core 3.3.8.
