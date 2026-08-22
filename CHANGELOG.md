@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.2-test
+
+- Added detailed serial diagnostics for wake start/end, K2/Web wake blocking, recording progress, Home Assistant WebSocket phases/events, TTS fetch, MP3 decoding, I2S write failures, and loop heartbeat while busy.
+- Added a short TTS amplifier warmup before WAV/MP3 samples are written to reduce clipped first words.
+
 ## v0.5.1-test
 
 - Added a short wake cooldown after Assist/TTS playback so K2 release or web polling cannot immediately trigger a second wake.
