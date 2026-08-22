@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.3-test
+
+- Added a compile-friendly diagnostics build with `ESP8266Audio`/MP3 disabled by default to avoid Arduino IDE library detection hanging while scanning the full decoder library.
+- Keeps the verbose wake, Home Assistant WebSocket, button/cooldown, and TTS URL diagnostics so the re-wake hang can be isolated first.
+
 ## v0.5.2-test
 
 - Added detailed serial diagnostics for wake start/end, K2/Web wake blocking, recording progress, Home Assistant WebSocket phases/events, TTS fetch, MP3 decoding, I2S write failures, and loop heartbeat while busy.
