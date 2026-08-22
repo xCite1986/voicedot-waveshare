@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.6-test
+
+- Added an orange rotating LED ring animation while VoiceDot is recording, uploading audio, waiting for Home Assistant Assist, and playing TTS.
+
 ## v0.4.5-test
 
 - Added first MP3 TTS playback path using the Arduino `ESP8266Audio` library.
