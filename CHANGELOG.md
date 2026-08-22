@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.8-test
+
+- Changed MP3 decoder includes back to normal Arduino library includes so the Arduino IDE dependency scanner adds `ESP8266Audio` to the compile path.
+- Keeps MP3 TTS playback enabled now that `ESP8266Audio` 2.4.1 is installed.
+
 ## v0.4.7-test
 
 - Made the MP3 decoder dependency optional with `__has_include`.
