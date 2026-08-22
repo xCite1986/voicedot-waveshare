@@ -83,7 +83,7 @@ or the IP shown in the serial monitor.
 
 ## Current Test Milestone
 
-`v0.5.3-test` moves the local audio base to the new ESP-IDF I2S STD driver, records a
+`v0.5.4-test` moves the local audio base to the new ESP-IDF I2S STD driver, records a
 short PCM sample after K2 short press or the web UI wake button, sends it to the Home
 Assistant Assist pipeline over WebSocket, then fetches and plays Home Assistant TTS
 when the returned media is WAV/PCM16 or MP3. It also adds a short wake cooldown after

@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.4-test
+
+- Added an explicit `updateButton(ButtonState&, bool)` prototype after `ButtonState` so Arduino IDE's auto-prototype generator does not emit an invalid declaration before the struct type is known.
+
 ## v0.5.3-test
 
 - Added a compile-friendly diagnostics build with `ESP8266Audio`/MP3 disabled by default to avoid Arduino IDE library detection hanging while scanning the full decoder library.
