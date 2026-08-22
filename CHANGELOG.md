@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.1-test
+
+- Added a short wake cooldown after Assist/TTS playback so K2 release or web polling cannot immediately trigger a second wake.
+- Hardened K2 handling while Assist is busy/cooling down to avoid stale button states becoming a new short press.
+- Added MP3 playback timeout/status reporting and marks the WebSocket stage as `tts-playback` while TTS is being played.
+
 ## v0.5.0-test
 
 - Migrated the firmware audio layer from the deprecated legacy I2S driver to the new ESP-IDF I2S STD channel driver.
