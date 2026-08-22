@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.5-test
+
+- Re-enabled MP3 support, but moved MP3 TTS playback into an isolated FreeRTOS task so Home Assistant Assist completion, the web UI, and wake/cooldown handling are not blocked by the decoder.
+- Wake is now blocked while the MP3 task is active, then released only after TTS finishes or times out plus cooldown.
+- Added an MP3 task watchdog that stops playback, disables the amplifier, restores the audio sample rate, and marks TTS as partial if the decoder task runs too long.
+- Extended serial diagnostics with a `task` flag for active async TTS playback.
+
 ## v0.5.4-test
 
 - Added an explicit `updateButton(ButtonState&, bool)` prototype after `ButtonState` so Arduino IDE's auto-prototype generator does not emit an invalid declaration before the struct type is known.

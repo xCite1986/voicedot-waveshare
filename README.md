@@ -83,11 +83,10 @@ or the IP shown in the serial monitor.
 
 ## Current Test Milestone
 
-`v0.5.4-test` moves the local audio base to the new ESP-IDF I2S STD driver, records a
+`v0.5.5-test` moves the local audio base to the new ESP-IDF I2S STD driver, records a
 short PCM sample after K2 short press or the web UI wake button, sends it to the Home
 Assistant Assist pipeline over WebSocket, then fetches and plays Home Assistant TTS
 when the returned media is WAV/PCM16 or MP3. It also adds a short wake cooldown after
 Assist/TTS so a button release or web retry cannot immediately start a second run.
-This build adds verbose serial diagnostics for the current re-wake/TTS hang test and
-keeps MP3 disabled by default so Arduino IDE does not scan the full `ESP8266Audio`
-library during this diagnostic pass.
+This build plays MP3 TTS in an isolated task with a watchdog so the web UI and re-wake
+guard stay responsive while the decoder is tested.
