@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.7-test
+
+- Added a more conservative TTS playback lifecycle: amplifier, mute, volume, sample-rate switch, TX clear, and pre-roll silence are now prepared together before audio samples are written.
+- MP3 playback now waits for the first valid decoded frame before starting the amplifier path, so the stream's real sample rate is known before the first audible sample.
+- Added short tail silence and a longer wake cooldown after playback cleanup to reduce clipped speech, stutter, and accidental re-wake.
+- Resets the K2 debounce/press state at the end of every wake run so a stale short press cannot fire again after TTS.
+
 ## v0.5.6-test
 
 - Replaced the ESP8266Audio MP3 path with a sketch-local Helix MP3 decoder (`mp3_decoder.cpp` / `mp3_decoder.h`) so Arduino IDE does not scan the full ESP8266Audio library.

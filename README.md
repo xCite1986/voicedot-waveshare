@@ -50,6 +50,7 @@ Adafruit NeoPixel
 - `VoiceDot_Waveshare_v0_4_11`: disables ESP8266Audio MP3 playback to avoid the new-vs-legacy I2S driver boot conflict.
 - `VoiceDot_Waveshare_v0_5_0`: migrates the firmware to the new ESP-IDF I2S STD driver and re-enables MP3 TTS playback.
 - `VoiceDot_Waveshare_v0_5_6`: uses sketch-local Helix MP3 decoder files instead of scanning the full ESP8266Audio library.
+- `VoiceDot_Waveshare_v0_5_7`: delays MP3 playback start until the first valid frame rate is known, adds TTS pre-roll/tail silence, and hard-resets K2 state after wake.
 
 ## Button Mapping
 
