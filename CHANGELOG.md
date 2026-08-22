@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.6-test
+
+- Replaced the ESP8266Audio MP3 path with a sketch-local Helix MP3 decoder (`mp3_decoder.cpp` / `mp3_decoder.h`) so Arduino IDE does not scan the full ESP8266Audio library.
+- Streams Home Assistant `/api/tts_proxy/*.mp3` directly through the local decoder and writes PCM to the existing ES8311/I2S output path.
+- Removed the old inactive ESP8266Audio adapter block from the test sketch to keep compile detection small and predictable.
+
 ## v0.5.5-test
 
 - Re-enabled MP3 support, but moved MP3 TTS playback into an isolated FreeRTOS task so Home Assistant Assist completion, the web UI, and wake/cooldown handling are not blocked by the decoder.
