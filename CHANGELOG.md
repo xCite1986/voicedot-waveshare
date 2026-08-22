@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.9-test
+
+- Switched MP3 decoder include to the official `ESP8266Audio.h` aggregate header so Arduino IDE can detect the installed library reliably.
+
 ## v0.4.8-test
 
 - Changed MP3 decoder includes back to normal Arduino library includes so the Arduino IDE dependency scanner adds `ESP8266Audio` to the compile path.

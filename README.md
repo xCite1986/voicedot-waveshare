@@ -46,6 +46,7 @@ ESP8266Audio
 - `VoiceDot_Waveshare_v0_4_6`: adds orange rotating wait/thinking LED animation during Assist processing.
 - `VoiceDot_Waveshare_v0_4_7`: makes the MP3 decoder optional so the sketch compiles even before `ESP8266Audio` is installed.
 - `VoiceDot_Waveshare_v0_4_8`: uses normal `ESP8266Audio` includes so Arduino IDE detects the installed MP3 library.
+- `VoiceDot_Waveshare_v0_4_9`: uses the official `ESP8266Audio.h` aggregate header for Arduino IDE library detection.
 
 ## Button Mapping
 
@@ -79,7 +80,7 @@ or the IP shown in the serial monitor.
 
 ## Current Test Milestone
 
-`v0.4.8-test` records a short PCM sample after K2 short press or the web UI wake button,
+`v0.4.9-test` records a short PCM sample after K2 short press or the web UI wake button,
 sends it to the Home Assistant Assist pipeline over WebSocket, then fetches and plays
 Home Assistant TTS when the returned media is WAV/PCM16 or MP3. Ogg/Opus is shown in
 the diagnostics and needs a later decoder step.
