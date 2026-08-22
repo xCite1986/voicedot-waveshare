@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.10-test
+
+- Replaced the broad `ESP8266Audio.h` aggregate include with the four specific MP3 decoder headers again.
+- Added early serial `BOOT:` breadcrumbs to identify startup crash location.
+
 ## v0.4.9-test
 
 - Switched MP3 decoder include to the official `ESP8266Audio.h` aggregate header so Arduino IDE can detect the installed library reliably.
