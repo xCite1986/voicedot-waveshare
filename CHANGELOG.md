@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.7-test
+
+- Made the MP3 decoder dependency optional with `__has_include`.
+- The firmware now compiles without `ESP8266Audio`; MP3 TTS reports a clear diagnostic until the library is installed.
+
 ## v0.4.6-test
 
 - Added an orange rotating LED ring animation while VoiceDot is recording, uploading audio, waiting for Home Assistant Assist, and playing TTS.

@@ -44,6 +44,7 @@ ESP8266Audio
 - `VoiceDot_Waveshare_v0_4_4`: compile fix for Arduino-ESP32 Core 3.3.8 TTS stream reading.
 - `VoiceDot_Waveshare_v0_4_5`: adds MP3 TTS decode/playback for Home Assistant `/api/tts_proxy/*.mp3`.
 - `VoiceDot_Waveshare_v0_4_6`: adds orange rotating wait/thinking LED animation during Assist processing.
+- `VoiceDot_Waveshare_v0_4_7`: makes the MP3 decoder optional so the sketch compiles even before `ESP8266Audio` is installed.
 
 ## Button Mapping
 
@@ -77,7 +78,7 @@ or the IP shown in the serial monitor.
 
 ## Current Test Milestone
 
-`v0.4.6-test` records a short PCM sample after K2 short press or the web UI wake button,
+`v0.4.7-test` records a short PCM sample after K2 short press or the web UI wake button,
 sends it to the Home Assistant Assist pipeline over WebSocket, then fetches and plays
 Home Assistant TTS when the returned media is WAV/PCM16 or MP3. Ogg/Opus is shown in
 the diagnostics and needs a later decoder step.
