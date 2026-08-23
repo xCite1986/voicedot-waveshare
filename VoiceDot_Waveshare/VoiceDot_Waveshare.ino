@@ -183,6 +183,13 @@ static const char *DEFAULT_TIMEZONE = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 static constexpr uint8_t PIPELINE_MAX = 8;
 
+// User uploaded sound effects, played from an announcement by writing
+// "[dingdong.mp3] Es hat geläutet." They live next to the acknowledgement
+// clips in LittleFS, in their own directory so the two never collide.
+static const char *SOUND_DIR = "/snd";
+static constexpr size_t SOUND_MAX_BYTES = 512 * 1024;
+static constexpr uint8_t SOUND_MAX_FILES = 20;
+
 static constexpr uint8_t ACK_MAX_CLIPS = 8;
 static constexpr size_t ACK_MAX_CLIP_BYTES = 96 * 1024;
 static const char *ACK_DEFAULT_PHRASES =
@@ -375,6 +382,14 @@ uint32_t haPublishAt = 0;
 bool timeValid = false;
 int8_t scheduleApplied = -1;  // -1 unknown, 0 day, 1 night
 
+File soundUploadFile;
+String soundUploadName = "";
+String soundUploadStatus = "-";
+size_t soundUploadBytes = 0;
+bool soundUploadFailed = false;
+
+String soundPlayRequest = "";
+
 String announceText = "";
 String announceStatus = "-";
 bool announceRequested = false;
@@ -397,6 +412,17 @@ float wakeNoiseFloorDb = VAD_NOISE_FLOOR_START_DB;
 uint32_t diagSeq = 0;
 uint32_t ttsOutputBytes = 0;
 uint32_t ttsWriteFailures = 0;
+
+// State of one streamed Assist turn. Defined up here because the Arduino
+// preprocessor inserts generated prototypes above the first function in the
+// file, and those prototypes already mention this type.
+struct AssistStream {
+  Client *client = nullptr;
+  int handlerId = -1;
+  uint8_t frame[1025];   // [0] = handler id, the rest is PCM
+  size_t pending = 0;
+  bool failed = false;
+};
 
 // -----------------------------------------------------------------------------
 // Serial log mirror
@@ -555,7 +581,10 @@ static String minutesToHhMm(uint16_t minutes);
 static uint16_t hhMmToMinutes(const String &value, uint16_t fallback);
 static void applySchedule(bool force);
 bool playAckSound();
+bool playSoundFile(const String &name);
 uint8_t ackScanClips();
+String stripMarkdownForSpeech(const String &in);
+
 bool wakeCanStart();
 bool srBegin();
 void srPauseDetection();
@@ -3221,9 +3250,36 @@ bool playAckSound() {
 
 // One-shot announcement: render, play, done. Nothing is cached, the text comes
 // from whoever called the API - a doorbell automation, for instance.
-static bool playAnnouncement(const String &text) {
+static bool playAnnouncement(const String &rawText) {
   String url;
   String err;
+
+  // Leading "[name.mp3]" tokens are played first, in the order given, and
+  // then whatever text is left gets spoken.
+  String text = rawText;
+  text.trim();
+
+  bool playedSound = false;
+  while (text.startsWith("[")) {
+    int close = text.indexOf(']');
+    if (close < 0) break;
+
+    String name = text.substring(1, close);
+    name.trim();
+    text = text.substring(close + 1);
+    text.trim();
+
+    setLedPhase(LED_PHASE_SPEAK);
+    if (playSoundFile(name)) playedSound = true;
+    else diagLogf("ANNOUNCE", "sound \"%s\" skipped", name.c_str());
+  }
+
+  if (text.isEmpty()) {
+    // Sound only, nothing to say.
+    wakeIgnoreUntil = millis();
+    announceStatus = playedSound ? "Klang abgespielt" : "nichts abzuspielen";
+    return playedSound;
+  }
 
   if (!haRenderTts(text, url, err)) {
     announceStatus = err;
@@ -3606,25 +3662,193 @@ static float frameLevelDb(const int16_t *mono, size_t samples, int16_t *peakOut)
   return rms > 1.0f ? 20.0f * log10f(rms / 32768.0f) : -96.0f;
 }
 
-// Records one Assist turn.
+// -----------------------------------------------------------------------------
+// Assist turn, streamed
 //
-// With VAD enabled the recorder keeps a short pre-roll so the first syllable
-// is not clipped, waits for the speaker to start, and stops again after
-// WAKE_SILENCE_MS of silence. Without VAD it records a fixed window.
-bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
-  *audioOut = nullptr;
-  *bytesOut = 0;
-  diagLogf("WAKE_REC", "start vad=%u", cfg.vadEnabled ? 1 : 0);
+// The pipeline is opened *before* recording and every captured frame goes
+// straight out over the WebSocket. Speech-to-text therefore runs while the user
+// is still talking, instead of starting only once the recording is complete.
+// Measured against the buffered version this removes the upload from the
+// critical path and lets a slow cloud STT overlap with the speech itself.
+//
+// Home Assistant runs its own VAD on the incoming stream. If it decides the
+// utterance is over before we do, stt-end arrives while we are still recording
+// and we stop right there - which is faster than our own silence timer.
+// -----------------------------------------------------------------------------
 
-  if (!audioI2sReady || !codecRecordReady) {
-    wakeLastMessage = "Mikrofon ist nicht bereit.";
-    diagLog("WAKE_REC", wakeLastMessage);
+static bool assistFlush(AssistStream &st) {
+  if (st.pending == 0 || st.failed) return !st.failed;
+
+  if (!wsSendFrame(*st.client, 0x2, st.frame, st.pending + 1)) {
+    st.failed = true;
+    diagLog("ASSIST", "audio stream write failed");
     return false;
   }
 
-  uint8_t *audio = (uint8_t*)ps_malloc(WAKE_MAX_BYTES);
-  if (!audio) {
-    wakeLastMessage = "PSRAM-Aufnahmepuffer konnte nicht reserviert werden.";
+  wakeLastBytes += st.pending;
+  st.pending = 0;
+  return true;
+}
+
+static bool assistWrite(AssistStream &st, const uint8_t *data, size_t len) {
+  if (st.failed) return false;
+
+  while (len > 0) {
+    size_t room = sizeof(st.frame) - 1 - st.pending;
+    size_t chunk = min<size_t>(room, len);
+    memcpy(st.frame + 1 + st.pending, data, chunk);
+    st.pending += chunk;
+    data += chunk;
+    len -= chunk;
+
+    if (st.pending == sizeof(st.frame) - 1 && !assistFlush(st)) return false;
+  }
+  return true;
+}
+
+// Consumes whatever Home Assistant has already sent, without blocking the
+// recording. Returns true when stt-end arrived, meaning HA is done listening.
+static bool assistPollEvents(AssistStream &st, bool &errorOut) {
+  bool sttEnded = false;
+  String msg;
+  uint8_t opcode = 0;
+
+  while (st.client && st.client->available() >= 2) {
+    if (!wsReadFrame(*st.client, msg, opcode, 500)) break;
+    if (opcode == 0x8) {
+      errorOut = true;
+      break;
+    }
+
+    updateAssistFromWsMessage(msg);
+    String eventType = assistEventType(msg);
+
+    if (eventType == "stt-end") sttEnded = true;
+    if (eventType == "error") {
+      wakeLastMessage = "HA Assist Fehler: " + msg.substring(0, min(180, (int)msg.length()));
+      diagLog("ASSIST", wakeLastMessage);
+      errorOut = true;
+      break;
+    }
+  }
+
+  return sttEnded;
+}
+
+// Opens the WebSocket, authenticates and starts the pipeline. On success the
+// stream is ready to take audio.
+static bool assistOpen(AssistStream &st, Client *client) {
+  st.client = client;
+  st.handlerId = -1;
+  st.pending = 0;
+  st.failed = false;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    wakeLastMessage = "WLAN ist nicht verbunden.";
+    diagLog("ASSIST", wakeLastMessage);
+    return false;
+  }
+
+  if (cfg.haUrl.isEmpty() || cfg.haToken.isEmpty()) {
+    wakeLastMessage = "Home-Assistant-URL oder Token fehlt.";
+    diagLog("ASSIST", wakeLastMessage);
+    return false;
+  }
+
+  String host;
+  uint16_t port = 0;
+  bool secure = false;
+  if (!parseHaUrl(cfg.haUrl, host, port, secure)) {
+    wakeLastMessage = "Home-Assistant-URL ist ungültig.";
+    diagLog("ASSIST", wakeLastMessage);
+    return false;
+  }
+
+  wakeSending = true;
+  wakeLastState = "connecting";
+  wakeLastMessage = "Verbinde mit Home Assistant.";
+  wakeLastHttpCode = 0;
+  wakeLastWsStage = "init";
+  wakeLastWsDetail = host + ":" + String(port) + (secure ? " https" : " http");
+  wakeTranscript = "";
+  wakeAssistantText = "";
+  wakeTtsUrl = "";
+  wakeTtsStatus = "-";
+  wakeLastBytes = 0;
+  localCommandHandled = false;
+  setLedPhase(LED_PHASE_THINK);
+
+  if (!wsConnectHa(*client, host, port, cfg.haToken)) {
+    wakeLastMessage = "HA WS/Auth fehlgeschlagen bei " + wakeLastWsStage + ": " + wakeLastWsDetail;
+    diagLog("ASSIST", wakeLastMessage);
+    return false;
+  }
+
+  wakeLastHttpCode = 101;
+  wakeLastWsStage = "pipeline-start";
+  wakeLastWsDetail = "auth ok";
+
+  if (haConversationId.length() > 0 &&
+      (uint32_t)(millis() - haConversationSeenAt) > CONVERSATION_TTL_MS) {
+    diagLog("ASSIST", "conversation expired, starting a new one");
+    haConversationId = "";
+  }
+
+  String run = "{\"id\":1,\"type\":\"assist_pipeline/run\"";
+  run += ",\"start_stage\":\"stt\",\"end_stage\":\"tts\"";
+  run += ",\"input\":{\"sample_rate\":16000}";
+  run += ",\"timeout\":30";
+  if (cfg.haPipeline.length() > 0) {
+    run += ",\"pipeline\":\"" + jsonEscape(cfg.haPipeline) + "\"";
+  }
+  if (haConversationId.length() > 0) {
+    run += ",\"conversation_id\":\"" + jsonEscape(haConversationId) + "\"";
+  }
+  run += "}";
+
+  diagLogf("ASSIST", "pipeline/run send pipeline=%s conversation=%s",
+           cfg.haPipeline.length() > 0 ? cfg.haPipeline.c_str() : "default",
+           haConversationId.length() > 0 ? haConversationId.c_str() : "new");
+  wsSendText(*client, run);
+
+  String msg;
+  uint8_t opcode = 0;
+  uint32_t waitStart = millis();
+
+  while ((uint32_t)(millis() - waitStart) < 8000) {
+    if (!wsReadFrame(*client, msg, opcode, 8000)) break;
+    if (opcode == 0x8) break;
+
+    updateAssistFromWsMessage(msg);
+
+    int id = jsonFindInt(msg, "stt_binary_handler_id", -1);
+    if (id >= 0 && id <= 255) {
+      st.handlerId = id;
+      st.frame[0] = (uint8_t)id;
+      wakeLastWsStage = "audio-stream";
+      diagLogf("ASSIST", "handler=%d, ready to stream", id);
+      return true;
+    }
+
+    if (assistEventType(msg) == "error") {
+      wakeLastMessage = "HA meldet Fehler vor Audio: " + msg.substring(0, min(180, (int)msg.length()));
+      diagLog("ASSIST", wakeLastMessage);
+      return false;
+    }
+  }
+
+  wakeLastMessage = "HA hat keinen STT-Audiokanal geliefert.";
+  wakeLastWsStage = "stt-handler";
+  diagLog("ASSIST", wakeLastMessage);
+  return false;
+}
+
+// Records with VAD and streams every frame as it arrives. Returns false when
+// nothing was spoken or the stream broke.
+static bool assistRecordAndStream(AssistStream &st) {
+  if (!audioI2sReady || !codecRecordReady) {
+    wakeLastMessage = "Mikrofon ist nicht bereit.";
+    diagLog("WAKE_REC", wakeLastMessage);
     return false;
   }
 
@@ -3633,20 +3857,15 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
   size_t prerollHead = 0;
   if (cfg.vadEnabled) {
     preroll = (uint8_t*)malloc(WAKE_PREROLL_BYTES);
-    if (!preroll) {
-      diagLog("WAKE_REC", "pre-roll buffer unavailable, continuing without it");
-    }
+    if (!preroll) diagLog("WAKE_REC", "pre-roll buffer unavailable, continuing without it");
   }
 
   wakeRecording = true;
   wakeLastState = cfg.vadEnabled ? "listening" : "recording";
   wakeLastMessage = cfg.vadEnabled ? "Ich höre zu." : "Aufnahme läuft.";
-  wakeLastBytes = 0;
   wakeLastVadSilenceMs = 0;
   setLedPhase(LED_PHASE_LISTEN);
 
-  // Drop whatever the DMA collected while the LEDs and the amplifier were set
-  // up, and after a wake word the tail of the wake word itself.
   int16_t stereo[AUDIO_FRAME_SAMPLES * 2];
   int16_t mono[AUDIO_FRAME_SAMPLES];
   size_t bytesRead = 0;
@@ -3665,11 +3884,9 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
   float calibrationSum = 0.0f;
   uint32_t calibrationFrames = 0;
   uint32_t voiceFrames = 0;
+  bool haStopped = false;
+  bool haError = false;
 
-  // After a wake word the speaker often runs straight into the command, and
-  // measuring the noise floor on that speech would raise the threshold above
-  // the rest of the sentence. The detector has been listening to this room the
-  // whole time, so start from its estimate and skip our own measurement.
   bool needCalibration = true;
   if (srRoomNoiseValid && (uint32_t)(started - srRoomNoiseAt) < SR_ROOM_NOISE_TTL_MS) {
     noiseFloorDb = srRoomNoiseDb;
@@ -3688,7 +3905,11 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
       diagLog("WAKE_REC", "max length reached");
       break;
     }
-    if (wakeLastBytes + sizeof(mono) > WAKE_MAX_BYTES) break;
+    if (st.failed || haError) break;
+    if (haStopped) {
+      diagLog("WAKE_REC", "Home Assistant ended the utterance first");
+      break;
+    }
 
     esp_err_t err = audioRead(stereo, sizeof(stereo), &bytesRead, 60);
     if (err == ESP_OK && bytesRead >= sizeof(int16_t) * 2) {
@@ -3702,17 +3923,12 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
       int16_t peak = 0;
       float db = frameLevelDb(mono, monoSamples, &peak);
 
-
-      // Keep the web UI meter alive while we are recording.
       micPeak = peak;
       micDb = db;
       micLevel = constrain((int)map(peak, 0, 4000, 0, 100), 0, 100);
       micReadCount++;
       micLastBytes = bytesRead;
 
-      // Background tracking now runs in every phase, including while the user
-      // is talking: falling fast and rising very slowly makes it settle on the
-      // room noise rather than on the speaker.
       bool calibrating = needCalibration && !speechStarted &&
                          (elapsed < VAD_CALIBRATE_MS || calibrationFrames < 4);
       if (calibrating) {
@@ -3741,17 +3957,14 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
           diagLogf("WAKE_REC", "speech start db=%d floor=%d after=%lu",
                    (int)db, (int)noiseFloorDb, (unsigned long)elapsed);
 
-          // Flush the pre-roll so the first syllable survives.
+          // The pre-roll goes out first so the opening syllable is not lost.
           if (preroll && prerollFill > 0) {
             size_t oldest = prerollFill < WAKE_PREROLL_BYTES ? 0 : prerollHead;
-            size_t tail = prerollFill - oldest;
-            memcpy(audio, preroll + oldest, tail);
-            if (oldest > 0) memcpy(audio + tail, preroll, oldest);
-            wakeLastBytes = prerollFill;
+            assistWrite(st, preroll + oldest, prerollFill - oldest);
+            if (oldest > 0) assistWrite(st, preroll, oldest);
           }
 
-          memcpy(audio + wakeLastBytes, mono, monoBytes);
-          wakeLastBytes += monoBytes;
+          assistWrite(st, (const uint8_t*)mono, monoBytes);
         } else if (preroll) {
           size_t remaining = monoBytes;
           const uint8_t *src = (const uint8_t*)mono;
@@ -3767,16 +3980,11 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
           }
         }
       } else {
-        memcpy(audio + wakeLastBytes, mono, monoBytes);
-        wakeLastBytes += monoBytes;
+        assistWrite(st, (const uint8_t*)mono, monoBytes);
 
-        // Follow the speaker's own level: rise immediately, fall very slowly.
         if (db > speechPeakDb) speechPeakDb = db;
         else speechPeakDb = speechPeakDb * 0.999f + db * 0.001f;
 
-        // Quiet room: stay generous so trailing syllables survive.
-        // Noisy room: the gap to the background decides, and that gap is the
-        // one knob worth exposing - a printer needs more than a living room.
         float release = speechPeakDb - VAD_SPEECH_DROP_DB;
         float floorGuard = noiseFloorDb + (float)cfg.vadReleaseDb;
         if (release < floorGuard) release = floorGuard;
@@ -3803,51 +4011,44 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
       }
     }
 
+    // Keep the socket drained: Home Assistant reports stt-start, VAD events and
+    // errors while we are still sending.
+    if (speechStarted && assistPollEvents(st, haError)) haStopped = true;
+
     pumpServices();
     ledTick();
 
     if ((uint32_t)(millis() - lastLog) > 1000) {
       lastLog = millis();
-      diagLogf("WAKE_REC", "progress bytes=%lu db=%d floor=%d rel=%d peak=%d silence=%lu",
+      diagLogf("WAKE_REC", "streaming sent=%lu db=%d floor=%d rel=%d silence=%lu",
                (unsigned long)wakeLastBytes,
                (int)micDb,
                (int)noiseFloorDb,
                (int)lastRelease,
-               (int)speechPeakDb,
                (unsigned long)wakeLastVadSilenceMs);
     }
   }
 
   if (preroll) free(preroll);
 
+  assistFlush(st);
+
   wakeRecording = false;
   wakeLastDurationMs = millis() - started;
-  *audioOut = audio;
-  *bytesOut = wakeLastBytes;
 
   if (!speechStarted) {
-    free(audio);
-    *audioOut = nullptr;
-    *bytesOut = 0;
     wakeLastMessage = "Nichts gehört. Bitte direkt nach dem Tastendruck sprechen.";
     diagLogf("WAKE_REC", "no speech floor=%d duration=%lu",
-             (int)noiseFloorDb,
-             (unsigned long)wakeLastDurationMs);
+             (int)noiseFloorDb, (unsigned long)wakeLastDurationMs);
     return false;
   }
 
-  if (wakeLastBytes < AUDIO_SAMPLE_RATE / 2) {
-    free(audio);
-    *audioOut = nullptr;
-    *bytesOut = 0;
-    wakeLastMessage = "Aufnahme war zu kurz.";
-    diagLogf("WAKE_REC", "too short bytes=%lu duration=%lu",
-             (unsigned long)wakeLastBytes,
-             (unsigned long)wakeLastDurationMs);
+  if (st.failed) {
+    wakeLastMessage = "Audio-Upload zu HA abgebrochen.";
     return false;
   }
 
-  diagLogf("WAKE_REC", "done bytes=%lu duration=%lu voice=%lu floor=%d rel=%d",
+  diagLogf("WAKE_REC", "done sent=%lu duration=%lu voice=%lu floor=%d rel=%d",
            (unsigned long)wakeLastBytes,
            (unsigned long)wakeLastDurationMs,
            (unsigned long)voiceFrames,
@@ -3856,166 +4057,27 @@ bool recordWakeAudio(uint8_t **audioOut, size_t *bytesOut) {
   return true;
 }
 
-bool sendAudioToHaAssist(const uint8_t *audio, size_t bytes) {
-  diagLogf("ASSIST", "start bytes=%lu", (unsigned long)bytes);
-  if (WiFi.status() != WL_CONNECTED) {
-    wakeLastMessage = "WLAN ist nicht verbunden.";
-    diagLog("ASSIST", wakeLastMessage);
-    return false;
-  }
-
-  if (cfg.haUrl.isEmpty() || cfg.haToken.isEmpty()) {
-    wakeLastMessage = "Home-Assistant-URL oder Token fehlt.";
-    diagLog("ASSIST", wakeLastMessage);
-    return false;
-  }
-
-  String host;
-  uint16_t port = 0;
-  bool secure = false;
-  if (!parseHaUrl(cfg.haUrl, host, port, secure)) {
-    wakeLastMessage = "Home-Assistant-URL ist ungültig.";
-    diagLog("ASSIST", wakeLastMessage);
-    return false;
-  }
-
-  WiFiClient plainClient;
-  WiFiClientSecure secureClient;
-  Client *client = nullptr;
-  if (secure) {
-    secureClient.setInsecure();
-    client = &secureClient;
-  } else {
-    client = &plainClient;
-  }
+// Closes the audio channel and waits for the answer, then plays it.
+static bool assistFinish(AssistStream &st) {
+  uint8_t endFrame[1] = {(uint8_t)st.handlerId};
+  wsSendFrame(*st.client, 0x2, endFrame, 1);
+  diagLog("ASSIST", "audio end frame sent");
 
   wakeSending = true;
   wakeLastState = "sending";
-  wakeLastMessage = "Sende Audio an Home Assistant.";
-  haContinueConversation = false;
+  wakeLastMessage = "Warte auf Home Assistant.";
   setLedPhase(LED_PHASE_THINK);
-  wakeLastHttpCode = 0;
-  wakeLastWsStage = "init";
-  wakeLastWsDetail = host + ":" + String(port) + (secure ? " https" : " http");
-  wakeTranscript = "";
-  wakeAssistantText = "";
-  wakeTtsUrl = "";
-  wakeTtsStatus = "-";
-  localCommandHandled = false;
-
-  if (!wsConnectHa(*client, host, port, cfg.haToken)) {
-    wakeSending = false;
-    wakeLastMessage = "HA WS/Auth fehlgeschlagen bei " + wakeLastWsStage + ": " + wakeLastWsDetail;
-    diagLog("ASSIST", wakeLastMessage);
-    client->stop();
-    return false;
-  }
-
-  wakeLastHttpCode = 101;
-  wakeLastWsStage = "pipeline-start";
-  wakeLastWsDetail = "auth ok";
-
-  // Drop a stale conversation so HA does not resume a context from an hour ago.
-  if (haConversationId.length() > 0 &&
-      (uint32_t)(millis() - haConversationSeenAt) > CONVERSATION_TTL_MS) {
-    diagLog("ASSIST", "conversation expired, starting a new one");
-    haConversationId = "";
-  }
-
-  String run = "{\"id\":1,\"type\":\"assist_pipeline/run\"";
-  run += ",\"start_stage\":\"stt\",\"end_stage\":\"tts\"";
-  run += ",\"input\":{\"sample_rate\":16000}";
-  run += ",\"timeout\":30";
-  if (cfg.haPipeline.length() > 0) {
-    run += ",\"pipeline\":\"" + jsonEscape(cfg.haPipeline) + "\"";
-  }
-  if (haConversationId.length() > 0) {
-    run += ",\"conversation_id\":\"" + jsonEscape(haConversationId) + "\"";
-  }
-  run += "}";
-
-  diagLogf("ASSIST", "pipeline/run send pipeline=%s conversation=%s",
-           cfg.haPipeline.length() > 0 ? cfg.haPipeline.c_str() : "default",
-           haConversationId.length() > 0 ? haConversationId.c_str() : "new");
-  wsSendText(*client, run);
-
-  int handlerId = -1;
-  String msg;
-  uint8_t opcode = 0;
-  uint32_t waitStart = millis();
-
-  while ((uint32_t)(millis() - waitStart) < 8000) {
-    if (!wsReadFrame(*client, msg, opcode, 8000)) break;
-    if (opcode == 0x8) break;
-    updateAssistFromWsMessage(msg);
-    int id = jsonFindInt(msg, "stt_binary_handler_id", -1);
-    if (id >= 0) {
-      handlerId = id;
-      wakeLastWsStage = "audio-upload";
-      diagLogf("ASSIST", "handler=%d", handlerId);
-      break;
-    }
-    // Only a real error event counts. Matching on the substring "error"
-    // aborted perfectly good runs, because tool results from the language
-    // model routinely carry that word in their payload.
-    if (assistEventType(msg) == "error") {
-      wakeLastMessage = "HA meldet Fehler vor Audio: " + msg.substring(0, min(180, (int)msg.length()));
-      diagLog("ASSIST", wakeLastMessage);
-      client->stop();
-      wakeSending = false;
-      return false;
-    }
-  }
-
-  if (handlerId < 0 || handlerId > 255) {
-    wakeLastMessage = "HA hat keinen STT-Audiokanal geliefert.";
-    wakeLastWsStage = "stt-handler";
-    diagLog("ASSIST", wakeLastMessage);
-    client->stop();
-    wakeSending = false;
-    return false;
-  }
-
-  uint8_t frame[1025];
-  frame[0] = (uint8_t)handlerId;
-  size_t sent = 0;
-  while (sent < bytes) {
-    size_t chunk = min<size_t>(sizeof(frame) - 1, bytes - sent);
-    memcpy(frame + 1, audio + sent, chunk);
-    if (!wsSendFrame(*client, 0x2, frame, chunk + 1)) {
-      wakeLastMessage = "Audio-Upload zu HA abgebrochen.";
-      wakeLastWsStage = "audio-upload";
-      diagLogf("ASSIST", "upload failed sent=%lu/%lu",
-               (unsigned long)sent,
-               (unsigned long)bytes);
-      client->stop();
-      wakeSending = false;
-      return false;
-    }
-    sent += chunk;
-    if ((sent % 16384) < chunk) {
-      diagLogf("ASSIST", "upload sent=%lu/%lu",
-               (unsigned long)sent,
-               (unsigned long)bytes);
-    }
-    ledTick();
-    if ((sent % 8192) < chunk) {
-      pumpServices();
-      delay(1);
-    }
-    yield();
-  }
-
-  uint8_t endFrame[1] = {(uint8_t)handlerId};
-  wsSendFrame(*client, 0x2, endFrame, 1);
-  diagLog("ASSIST", "audio end frame sent");
 
   bool ok = false;
+  String msg;
+  uint8_t opcode = 0;
   uint32_t resultStart = millis();
   uint32_t lastWaitLog = resultStart;
+
   while ((uint32_t)(millis() - resultStart) < 30000) {
-    if (!wsReadFrame(*client, msg, opcode, 30000)) break;
+    if (!wsReadFrame(*st.client, msg, opcode, 30000)) break;
     if (opcode == 0x8) break;
+
     updateAssistFromWsMessage(msg);
     String eventType = assistEventType(msg);
 
@@ -4034,6 +4096,7 @@ bool sendAudioToHaAssist(const uint8_t *audio, size_t bytes) {
 
     pumpServices();
     ledTick();
+
     if ((uint32_t)(millis() - lastWaitLog) > 3000) {
       lastWaitLog = millis();
       diagLogf("ASSIST", "waiting result stage=%s transcript=%u assistant=%u ttsUrl=%u",
@@ -4045,76 +4108,107 @@ bool sendAudioToHaAssist(const uint8_t *audio, size_t bytes) {
     yield();
   }
 
-  client->stop();
+  st.client->stop();
   wakeSending = false;
+
   diagLogf("ASSIST", "ws closed ok=%u stage=%s ttsUrl=%s",
-           ok ? 1 : 0,
-           wakeLastWsStage.c_str(),
-           wakeTtsUrl.c_str());
-  if (ok) {
-    if (localCommandHandled) {
-      // Home Assistant has no idea what to do with "Lautstärke 5" and would
-      // answer that it did not understand. Confirm with the chime instead.
-      wakeLastState = "done";
-      wakeTtsStatus = "lokaler Befehl, keine TTS";
-      setLedPhase(LED_PHASE_SPEAK);
-      playAckChime();
-      diagLog("ASSIST", "local command handled, HA answer skipped");
-    } else if (wakeTtsUrl.length() > 0) {
-      wakeLastState = "tts";
-      wakeLastWsStage = "tts-playback";
-      wakeLastMessage = "Spiele HA TTS-Antwort.";
-      setLedPhase(LED_PHASE_SPEAK);
+           ok ? 1 : 0, wakeLastWsStage.c_str(), wakeTtsUrl.c_str());
 
-      String playUrl = wakeTtsUrl;
-
-      if (cfg.cleanMarkdown && wakeAssistantText.length() > 0) {
-        String clean = stripMarkdownForSpeech(wakeAssistantText);
-        if (clean.length() > 0 && clean != wakeAssistantText) {
-          String freshUrl;
-          String err;
-          if (haRenderTts(clean, freshUrl, err)) {
-            playUrl = freshUrl;
-            diagLogf("TTS_CLEAN", "re-rendered without markup (%u -> %u Zeichen)",
-                     wakeAssistantText.length(), clean.length());
-          } else {
-            diagLogf("TTS_CLEAN", "re-render failed (%s), playing HA audio",
-                     err.c_str());
-          }
-        }
-      }
-
-      bool ttsOk = fetchAndPlayTtsUrl(playUrl);
-      wakeLastState = ttsOk ? "done" : "partial";
-      wakeLastMessage = ttsOk
-                        ? "HA Assist fertig, TTS abgespielt."
-                        : "HA Assist fertig, TTS nicht abgespielt: " + wakeTtsStatus;
+  if (!ok) {
+    if (wakeLastMessage.length() == 0 || wakeLastMessage == "Warte auf Home Assistant.") {
+      wakeLastState = (wakeTranscript.length() > 0 || wakeAssistantText.length() > 0 ||
+                       wakeTtsUrl.length() > 0) ? "partial" : "error";
+      wakeLastMessage = "HA Assist hat nicht rechtzeitig geantwortet.";
     } else {
-      wakeLastState = "done";
-      wakeTtsStatus = "Keine TTS-URL von Home Assistant.";
-      if (wakeAssistantText.length() > 0) {
-        wakeLastMessage = "HA Assist fertig: " + wakeAssistantText;
-      } else if (wakeTranscript.length() > 0) {
-        wakeLastMessage = "HA Assist fertig: " + wakeTranscript;
-      } else {
-        wakeLastMessage = "HA Assist fertig.";
-      }
+      wakeLastState = "error";
     }
-  } else if (wakeLastMessage.length() == 0 || wakeLastMessage == "Sende Audio an Home Assistant.") {
-    wakeLastState = (wakeTranscript.length() > 0 || wakeAssistantText.length() > 0 || wakeTtsUrl.length() > 0)
-                    ? "partial"
-                    : "error";
-    wakeLastMessage = "HA Assist hat nicht rechtzeitig geantwortet.";
-  } else {
-    wakeLastState = "error";
+    return false;
   }
 
-  diagLogf("ASSIST", "end ok=%u state=%s msg=%s tts=%s",
-           ok ? 1 : 0,
-           wakeLastState.c_str(),
-           wakeLastMessage.c_str(),
-           wakeTtsStatus.c_str());
-  return ok;
+  if (localCommandHandled) {
+    wakeLastState = "done";
+    wakeTtsStatus = "lokaler Befehl, keine TTS";
+    setLedPhase(LED_PHASE_SPEAK);
+    playAckChime();
+    diagLog("ASSIST", "local command handled, HA answer skipped");
+    return true;
+  }
+
+  if (wakeTtsUrl.length() > 0) {
+    wakeLastState = "tts";
+    wakeLastWsStage = "tts-playback";
+    wakeLastMessage = "Spiele HA TTS-Antwort.";
+    setLedPhase(LED_PHASE_SPEAK);
+
+    String playUrl = wakeTtsUrl;
+
+    if (cfg.cleanMarkdown && wakeAssistantText.length() > 0) {
+      String clean = stripMarkdownForSpeech(wakeAssistantText);
+      if (clean.length() > 0 && clean != wakeAssistantText) {
+        String freshUrl;
+        String err;
+        if (haRenderTts(clean, freshUrl, err)) {
+          playUrl = freshUrl;
+          diagLogf("TTS_CLEAN", "re-rendered without markup (%u -> %u Zeichen)",
+                   wakeAssistantText.length(), clean.length());
+        } else {
+          diagLogf("TTS_CLEAN", "re-render failed (%s), playing HA audio", err.c_str());
+        }
+      }
+    }
+
+    bool ttsOk = fetchAndPlayTtsUrl(playUrl);
+    wakeLastState = ttsOk ? "done" : "partial";
+    wakeLastMessage = ttsOk
+                      ? "HA Assist fertig, TTS abgespielt."
+                      : "HA Assist fertig, TTS nicht abgespielt: " + wakeTtsStatus;
+    return true;
+  }
+
+  wakeLastState = "done";
+  wakeTtsStatus = "Keine TTS-URL von Home Assistant.";
+  if (wakeAssistantText.length() > 0) wakeLastMessage = "HA Assist fertig: " + wakeAssistantText;
+  else if (wakeTranscript.length() > 0) wakeLastMessage = "HA Assist fertig: " + wakeTranscript;
+  else wakeLastMessage = "HA Assist fertig.";
+  return true;
+}
+
+// One complete turn: open, stream, answer.
+static bool runAssistStreamingTurn(bool playAck) {
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+
+  bool secure = normalizedHaUrl(cfg.haUrl).startsWith("https://");
+  Client *client;
+  if (secure) {
+    secureClient.setInsecure();
+    client = &secureClient;
+  } else {
+    client = &plainClient;
+  }
+
+  AssistStream st;
+
+  // Opening the pipeline first costs about half a second. Doing it before the
+  // acknowledgement hides that behind a sound the user is listening to anyway.
+  if (!assistOpen(st, client)) {
+    client->stop();
+    wakeSending = false;
+    return false;
+  }
+
+  wakeSending = false;
+
+  if (playAck) playAckSound();
+
+  if (!assistRecordAndStream(st)) {
+    uint8_t endFrame[1] = {(uint8_t)st.handlerId};
+    if (!st.failed) wsSendFrame(*st.client, 0x2, endFrame, 1);
+    client->stop();
+    return false;
+  }
+
+  return assistFinish(st);
 }
 
 // Queues an Assist turn. The turn itself always runs from loop(), never from
@@ -4146,18 +4240,10 @@ void runWakeCaptureAndHa() {
   // No confirmation on a follow-up turn: the assistant just asked something,
   // answering it with "Ja bitte" would talk over its own question.
   bool isFollowUpTurn = strcmp(wakeRequestSource, "continue_conversation") == 0;
-  if (cfg.ackEnabled && !isFollowUpTurn) {
-    playAckSound();
-  }
+  bool playAck = cfg.ackEnabled && !isFollowUpTurn;
 
-  uint8_t *audio = nullptr;
-  size_t bytes = 0;
-  bool ok = recordWakeAudio(&audio, &bytes);
-  if (ok && audio) {
-    ok = sendAudioToHaAssist(audio, bytes);
-  }
+  bool ok = runAssistStreamingTurn(playAck);
 
-  if (audio) free(audio);
   if (!ok && wakeLastState != "error" && wakeLastState != "partial") wakeLastState = "error";
 
   // Home Assistant asks for another turn when the intent expects an answer.
@@ -5007,6 +5093,20 @@ spielt VoiceDot einen kurzen Zweiklang.
 </section>
 
 <section class="card full">
+<h2>KLÄNGE</h2>
+<form id="soundForm">
+ <input id="soundFile" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav">
+ <div class="actions"><button type="submit">Hochladen</button></div>
+</form>
+<div class="pinbox" id="soundBox" style="min-height:46px">Lade ...</div>
+<small class="help">
+Kleine MP3- oder WAV-Dateien, maximal 512 kB und 20 Stück. In einer Ansage
+vorangestellt abspielen mit <b>[dingdong.mp3] Es hat geläutet.</b> —
+mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
+</small>
+</section>
+
+<section class="card full">
 <h2>SERIAL LOG</h2>
 <div class="pinbox" id="logBox" style="height:280px;white-space:pre-wrap">Warte auf Logzeilen ...</div>
 <div class="actions">
@@ -5392,6 +5492,47 @@ spielt VoiceDot einen kurzen Zweiklang.
 "\n"
 "function clearLog(){logBuf=[];$('logBox').textContent='';}\n"
 "\n"
+"async function refreshSounds(){\n"
+" try{\n"
+"  const r=await fetch('/api/sound/list',{cache:'no-store'});\n"
+"  const j=await r.json();\n"
+"  const box=$('soundBox');\n"
+"  box.innerHTML='';\n"
+"  const files=j.files||[];\n"
+"  if(!files.length){\n"
+"   box.textContent='Noch keine Klänge hochgeladen.';\n"
+"   return;\n"
+"  }\n"
+"  files.forEach(f=>{\n"
+"   const row=document.createElement('div');\n"
+"   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0';\n"
+"   const label=document.createElement('span');\n"
+"   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
+"   label.textContent=f.name+'  ('+Math.round(f.size/1024)+' kB)';\n"
+"   const play=document.createElement('button');\n"
+"   play.type='button';play.className='secondary';play.textContent='Abspielen';\n"
+"   play.onclick=()=>soundPlay(f.name);\n"
+"   const del=document.createElement('button');\n"
+"   del.type='button';del.className='danger';del.textContent='Löschen';\n"
+"   del.onclick=()=>soundDelete(f.name);\n"
+"   row.appendChild(label);row.appendChild(play);row.appendChild(del);\n"
+"   box.appendChild(row);\n"
+"  });\n"
+" }catch(e){}\n"
+"}\n"
+"\n"
+"async function soundPlay(name){\n"
+" const r=await fetch('/api/sound/play?name='+encodeURIComponent(name),{method:'POST'});\n"
+" toast(await r.text());\n"
+"}\n"
+"\n"
+"async function soundDelete(name){\n"
+" if(!confirm(name+' löschen?'))return;\n"
+" const r=await fetch('/api/sound/delete?name='+encodeURIComponent(name),{method:'POST'});\n"
+" toast(await r.text());\n"
+" refreshSounds();\n"
+"}\n"
+"\n"
 "async function applyVad(){\n"
 " const p=new URLSearchParams();\n"
 " p.set('vad_release_db',$('vad_release_db').value);\n"
@@ -5435,6 +5576,21 @@ spielt VoiceDot einen kurzen Zweiklang.
 " toast('Werkseinstellungen werden geladen ...');\n"
 "}\n"
 "\n"
+"$('soundForm').addEventListener('submit',async e=>{\n"
+" e.preventDefault();\n"
+" const f=$('soundFile').files[0];\n"
+" if(!f){toast('Bitte eine Datei auswählen.');return}\n"
+" const fd=new FormData();\n"
+" fd.append('sound',f);\n"
+" toast('Upload läuft ...');\n"
+" try{\n"
+"  const r=await fetch('/api/sound/upload',{method:'POST',body:fd});\n"
+"  toast(await r.text());\n"
+"  $('soundFile').value='';\n"
+"  refreshSounds();\n"
+" }catch(e){toast('Upload fehlgeschlagen.')}\n"
+"});\n"
+"\n"
 "$('otaForm').addEventListener('submit',async e=>{\n"
 " e.preventDefault();\n"
 "\n"
@@ -5454,6 +5610,7 @@ spielt VoiceDot einen kurzen Zweiklang.
 "loadConfig();\n"
 "refreshStatus();\n"
 "refreshLog();\n"
+"refreshSounds();\n"
 "setInterval(refreshStatus,3000);\n"
 "setInterval(refreshLog,1500);\n"
 "\n"
@@ -6234,6 +6391,92 @@ static void applySchedule(bool force) {
             minutes / 60, minutes % 60);
 }
 
+// -----------------------------------------------------------------------------
+// Sound library
+// -----------------------------------------------------------------------------
+
+// Keeps a plain file name: no paths, no surprises, and an audio extension.
+static String soundSanitizeName(const String &raw) {
+  String name = raw;
+
+  int slash = name.lastIndexOf('/');
+  if (slash >= 0) name = name.substring(slash + 1);
+  slash = name.lastIndexOf('\\');
+  if (slash >= 0) name = name.substring(slash + 1);
+  name.trim();
+
+  String out;
+  for (size_t i = 0; i < name.length() && out.length() < 40; i++) {
+    char c = name[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+      out += c;
+    }
+  }
+
+  String lower = out;
+  lower.toLowerCase();
+  if (!lower.endsWith(".mp3") && !lower.endsWith(".wav")) return "";
+  if (out.length() < 5) return "";
+
+  return out;
+}
+
+static String soundPath(const String &name) {
+  return String(SOUND_DIR) + "/" + name;
+}
+
+static uint8_t soundCount() {
+  if (!ackFsReady) return 0;
+
+  uint8_t n = 0;
+  File dir = LittleFS.open(SOUND_DIR);
+  if (!dir || !dir.isDirectory()) return 0;
+
+  File entry = dir.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) n++;
+    entry = dir.openNextFile();
+  }
+  return n;
+}
+
+// Plays one uploaded file. MP3 and WAV both work, the decoder is picked by
+// extension just like for the acknowledgement clips.
+bool playSoundFile(const String &name) {
+  if (!ackFsReady) return false;
+
+  String clean = soundSanitizeName(name);
+  if (clean.isEmpty()) {
+    diagLogf("SOUND", "invalid name \"%s\"", name.c_str());
+    return false;
+  }
+
+  String path = soundPath(clean);
+  if (!LittleFS.exists(path)) {
+    diagLogf("SOUND", "not found: %s", path.c_str());
+    return false;
+  }
+
+  String lower = clean;
+  lower.toLowerCase();
+
+  bool ok = false;
+  if (lower.endsWith(".wav")) {
+    File f = LittleFS.open(path, "r");
+    if (f) {
+      ttsPlaybackActive = true;
+      ok = playWavPcm16(f);
+      f.close();
+    }
+  } else {
+    ok = playMp3File(path);
+  }
+
+  diagLogf("SOUND", "played %s ok=%u", clean.c_str(), ok ? 1 : 0);
+  return ok;
+}
+
 // Speaks a text handed in over HTTP. Accepts a form field, a query parameter
 // or a JSON body, so it is easy to call from a Home Assistant rest_command.
 static String minutesToHhMm(uint16_t minutes) {
@@ -6308,6 +6551,133 @@ void handleVolume() {
   haPublishAt = 0;  // report the change straight away
   server.send(200, "text/plain; charset=utf-8",
               "Lautstärke " + String(cfg.volume) + " %");
+}
+
+// Multipart upload of one sound file.
+void handleSoundUploadData() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    soundUploadBytes = 0;
+    soundUploadFailed = false;
+    soundUploadName = soundSanitizeName(upload.filename);
+
+    if (!ackFsReady) {
+      soundUploadFailed = true;
+      soundUploadStatus = "LittleFS ist nicht bereit.";
+      return;
+    }
+    if (soundUploadName.isEmpty()) {
+      soundUploadFailed = true;
+      soundUploadStatus = "Nur .mp3 und .wav, Name ohne Sonderzeichen.";
+      return;
+    }
+    if (!LittleFS.exists(soundPath(soundUploadName)) && soundCount() >= SOUND_MAX_FILES) {
+      soundUploadFailed = true;
+      soundUploadStatus = "Maximal " + String(SOUND_MAX_FILES) + " Dateien.";
+      return;
+    }
+
+    LittleFS.mkdir(SOUND_DIR);
+    soundUploadFile = LittleFS.open(soundPath(soundUploadName), "w");
+    if (!soundUploadFile) {
+      soundUploadFailed = true;
+      soundUploadStatus = "Datei konnte nicht angelegt werden.";
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (soundUploadFailed || !soundUploadFile) return;
+
+    if (soundUploadBytes + upload.currentSize > SOUND_MAX_BYTES) {
+      soundUploadFailed = true;
+      soundUploadStatus = "Datei ist größer als " + String(SOUND_MAX_BYTES / 1024) + " kB.";
+      soundUploadFile.close();
+      LittleFS.remove(soundPath(soundUploadName));
+      return;
+    }
+
+    soundUploadFile.write(upload.buf, upload.currentSize);
+    soundUploadBytes += upload.currentSize;
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (soundUploadFile) soundUploadFile.close();
+    if (!soundUploadFailed) {
+      soundUploadStatus = soundUploadName + " gespeichert (" +
+                          String(soundUploadBytes / 1024) + " kB)";
+      diagLogf("SOUND", "uploaded %s (%lu bytes)",
+               soundUploadName.c_str(), (unsigned long)soundUploadBytes);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (soundUploadFile) soundUploadFile.close();
+    LittleFS.remove(soundPath(soundUploadName));
+    soundUploadFailed = true;
+    soundUploadStatus = "Upload abgebrochen.";
+  }
+}
+
+void handleSoundUploadDone() {
+  server.send(soundUploadFailed ? 400 : 200, "text/plain; charset=utf-8", soundUploadStatus);
+}
+
+void handleSoundList() {
+  String json = "{\"max_files\":" + String(SOUND_MAX_FILES) +
+                ",\"max_bytes\":" + String(SOUND_MAX_BYTES) +
+                ",\"status\":\"" + jsonEscape(soundUploadStatus) + "\",\"files\":[";
+
+  if (ackFsReady) {
+    File dir = LittleFS.open(SOUND_DIR);
+    if (dir && dir.isDirectory()) {
+      bool first = true;
+      File entry = dir.openNextFile();
+      while (entry) {
+        if (!entry.isDirectory()) {
+          String name = entry.name();
+          int slash = name.lastIndexOf('/');
+          if (slash >= 0) name = name.substring(slash + 1);
+
+          if (!first) json += ",";
+          first = false;
+          json += "{\"name\":\"" + jsonEscape(name) + "\",\"size\":" + String(entry.size()) + "}";
+        }
+        entry = dir.openNextFile();
+      }
+    }
+  }
+
+  json += "]}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleSoundDelete() {
+  String name = soundSanitizeName(server.hasArg("name") ? server.arg("name") : String(""));
+  if (name.isEmpty()) {
+    server.send(400, "text/plain; charset=utf-8", "Kein gültiger Dateiname.");
+    return;
+  }
+
+  if (!LittleFS.exists(soundPath(name))) {
+    server.send(404, "text/plain; charset=utf-8", name + " gibt es nicht.");
+    return;
+  }
+
+  LittleFS.remove(soundPath(name));
+  soundUploadStatus = name + " gelöscht";
+  diagLogf("SOUND", "deleted %s", name.c_str());
+  server.send(200, "text/plain; charset=utf-8", soundUploadStatus);
+}
+
+void handleSoundPlay() {
+  String name = soundSanitizeName(server.hasArg("name") ? server.arg("name") : String(""));
+  if (name.isEmpty()) {
+    server.send(400, "text/plain; charset=utf-8", "Kein gültiger Dateiname.");
+    return;
+  }
+
+  if (wakeBusy || ttsPlaybackActive || speakerTestActive) {
+    server.send(409, "text/plain; charset=utf-8", "Gerade beschäftigt.");
+    return;
+  }
+
+  soundPlayRequest = name;
+  server.send(200, "text/plain; charset=utf-8", name + " wird abgespielt.");
 }
 
 void handlePipelineRefresh() {
@@ -6576,6 +6946,10 @@ void setupWebServer() {
   // HTTP_ANY so a plain browser URL works too:
   //   http://<host>/api/announce?text=Hallo
   server.on("/api/announce", HTTP_ANY, handleAnnounce);
+  server.on("/api/sound/list", HTTP_GET, handleSoundList);
+  server.on("/api/sound/delete", HTTP_ANY, handleSoundDelete);
+  server.on("/api/sound/play", HTTP_ANY, handleSoundPlay);
+  server.on("/api/sound/upload", HTTP_POST, handleSoundUploadDone, handleSoundUploadData);
   server.on("/api/volume", HTTP_ANY, handleVolume);
   server.on("/api/ha/pipelines", HTTP_POST, handlePipelineRefresh);
   server.on("/api/ack/build", HTTP_POST, handleAckBuild);
@@ -6790,6 +7164,16 @@ void loop() {
   if (wakeRequested && wakeCanStart()) {
     wakeRequested = false;
     runWakeCaptureAndHa();
+  }
+
+  if (soundPlayRequest.length() > 0 && !wakeBusy && !ttsPlaybackActive && !speakerTestActive) {
+    String name = soundPlayRequest;
+    soundPlayRequest = "";
+    srPauseDetection();
+    setLedPhase(LED_PHASE_SPEAK);
+    playSoundFile(name);
+    setLedPhase(LED_PHASE_IDLE);
+    srResumeDetection();
   }
 
   if (announceRequested && !wakeBusy && !wakeRequested && !ttsPlaybackActive && !speakerTestActive) {

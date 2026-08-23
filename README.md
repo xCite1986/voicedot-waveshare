@@ -178,6 +178,10 @@ Farben für Zuhören und Sprechen sind im Webinterface frei wählbar.
 | POST | `/api/audio/speaker-test` | Testton |
 | POST | `/api/assist/wake` | Assist-Runde starten |
 | POST | `/api/system/reboot` | Neustart |
+| GET | `/api/sound/list` | Hochgeladene Klänge auflisten |
+| POST | `/api/sound/upload` | Klang hochladen (multipart, Feld `sound`) |
+| GET/POST | `/api/sound/delete?name=…` | Klang löschen |
+| GET/POST | `/api/sound/play?name=…` | Klang abspielen |
 | POST | `/api/system/factory-reset` | NVS löschen |
 | POST | `/api/ota` | Firmware-Upload |
 
@@ -198,8 +202,33 @@ rest_command:
     payload: '{"text": "{{ text }}"}'
 ```
 
-Für die komfortable Anbindung gibt es zusätzlich eine HACS-Integration:
-[hass_voicedot-waveshare_hacs_plugin](https://github.com/xCite1986/hass_voicedot-waveshare_hacs_plugin)
+
+---
+
+## Klänge
+
+Kleine MP3- oder WAV-Dateien lassen sich im Webinterface hochladen (max. 512 kB,
+20 Stück) und in einer Ansage voranstellen:
+
+```text
+http://voicedot.local/api/announce?text=[dingdong.mp3] Es hat geläutet.
+```
+
+Mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional —
+`[dingdong.mp3]` allein spielt nur den Klang und spart den TTS-Aufruf.
+
+---
+
+## Wie eine Runde abläuft
+
+Das Audio wird **gestreamt, nicht gepuffert**: die Assist-Pipeline wird geöffnet,
+bevor die Aufnahme startet, und jeder Frame geht sofort raus. Die Spracherkennung
+arbeitet dadurch schon, während gesprochen wird, statt erst danach zu beginnen.
+Der Verbindungsaufbau (~0,5 s) liegt hinter der Ansage und fällt nicht auf.
+
+Der Pre-Roll-Puffer bleibt erhalten: gestreamt wird ab erkanntem Sprachbeginn,
+die gepufferten 320 ms davor gehen zuerst raus. Erkennt Home Assistant mit
+seiner eigenen VAD das Satzende früher als wir, wird sofort beendet.
 
 ---
 
@@ -245,7 +274,6 @@ Umstellung keine doppelte oder fehlende Stunde.
   kostenpflichtig.
 - Kein Barge-in: während der Antwort hört der Detektor nicht zu.
 - OGG/Opus wird nicht dekodiert — in HA MP3 oder WAV als TTS-Format wählen.
-- Das Audio wird komplett aufgenommen und dann gesendet, nicht gestreamt.
 - HTTPS zu Home Assistant läuft mit `setInsecure()`, das Zertifikat wird nicht
   geprüft.
 - **Die API ist unauthentifiziert** — inklusive OTA. VoiceDot gehört in ein
@@ -258,3 +286,11 @@ Umstellung keine doppelte oder fehlende Stunde.
 `mp3_decoder.cpp` / `mp3_decoder.h` basieren laut Kopfzeile auf dem
 **Helix MP3 Decoder** und wurden unverändert aus dem Ursprungsprojekt
 übernommen; die dortigen Lizenzbedingungen gelten weiter.
+---
+
+## Home-Assistant-Integration
+
+Für die komfortable Anbindung gibt es eine HACS-Integration:
+[hass_voicedot-waveshare_hacs_plugin](https://github.com/xCite1986/hass_voicedot-waveshare_hacs_plugin)
+— Erkennung per mDNS, ein Gerät je VoiceDot, Sensoren, Einstellungen und ein
+Dienst `voicedot.announce` für Ansagen.
