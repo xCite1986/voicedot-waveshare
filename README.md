@@ -4,8 +4,8 @@ Firmware für einen Home-Assistant-Sprachassistenten auf dem
 **Waveshare ESP32-S3-AUDIO-Board** — mit lokalem Wake-Word, Aufnahme,
 Assist-Pipeline und Sprachausgabe direkt auf dem Gerät.
 
-> Auf Hardware verifiziert: ESP32-S3 rev v0.2, 8 MB PSRAM, alle vier
-> I²C-Bausteine erkannt, Wake-Word aktiv, Gespräche end-to-end getestet.
+https://www.waveshare.com/esp32-s3-audio-board.htm
+https://www.berrybase.at/waveshare-esp32-s3-ai-smart-speaker-development-board-dual-mikrofon-wifi-bt5-16mb-flash-240-mhz
 
 Der Ordner `VoiceDot_Waveshare/` enthält immer den **aktuellen, lauffähigen
 Stand**. Ältere Versionen stehen unter
