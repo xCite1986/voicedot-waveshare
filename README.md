@@ -51,6 +51,8 @@ Bausteinen.
 - **REST-API** für Ansagen und Lautstärke, plus optionale Zustandsmeldung als
   Entität in Home Assistant.
 - **Serial-Log im Webinterface** — die letzten 200 Zeilen ohne USB-Kabel.
+- **Webradio** aus einer eigenen Senderliste, gestartet per Sprache
+  („Spiele Energy Wien") und beendet mit „Stopp".
 - **Mehrere VoiceDots** handeln untereinander aus, wer antwortet — der mit dem
   lauteren Signal führt das Gespräch.
 - **mDNS-Dienst** `_voicedot._tcp` für automatische Erkennung.
@@ -222,6 +224,62 @@ Mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional —
 
 ---
 
+## Webradio
+
+```text
+„Alexa"  →  „Spiele Energy Wien"     startet den Sender
+„Alexa"  →  „Stopp"                  beendet ihn wieder
+```
+
+Beides wertet das Gerät **selbst** aus, so wie „Lautstärke 5": die Senderliste
+liegt lokal, ein Sprachmodell könnte den Namen ohnehin nur nachschlagen.
+Gesprochener Name und gespeicherter Name werden vorher auf gemeinsamen Nenner
+gebracht — klein geschrieben, Umlaute ausgeschrieben, Satzzeichen weg —, und
+wenn nichts exakt passt, gewinnt der Sender mit den meisten übereinstimmenden
+Wörtern.
+
+Sender pflegst du im Webinterface unter **WEBRADIO**. Das Suchfeld fragt
+**radio-browser.info** ab, und zwar aus deinem Browser heraus, nicht vom Gerät:
+deren API erlaubt Cross-Origin-Anfragen, dadurch braucht der VoiceDot selbst
+keinen Fremddienst. Treffer ohne MP3 werden ausgeblendet, weil nur MP3
+dekodiert wird.
+
+### Warum das Radio mit 16 kHz läuft
+
+TX und RX hängen am selben I2S-Takt. Liefe die Musik mit ihren nativen 44,1
+oder 48 kHz, liefe das Mikrofon mit — und die Stichworterkennung braucht exakt
+16 kHz, sonst hört sie nur noch Zeitraffer. Deshalb wird der dekodierte Strom
+auf 16 kHz heruntergerechnet: ein Box-Filter, das alle Eingangswerte eines
+Ausgangswerts mittelt und damit gleichzeitig als Anti-Aliasing dient.
+
+Das kostet Höhen und kauft dafür, dass **„Alexa" während der Musik überhaupt
+gehört werden kann**. Am Gerät nachgemessen läuft der Detektor dabei mit voller
+Rate weiter (15 Feeds/s, keine Aussetzer).
+
+### Wenn das Stichwort fällt
+
+Die Musik pausiert für die Frage und läuft danach weiter. Ein Livestream lässt
+sich nicht anhalten, deshalb bleibt die Verbindung offen und die Bytes werden
+verworfen — nachträglich aufzuholen würde nur eine Verzögerung aufbauen, die
+nie wieder verschwindet. Der Ring zeigt währenddessen einen langsam wandernden
+Punkt in der Zuhör-Farbe.
+
+### API
+
+```text
+POST /api/radio/play?name=Energy%20Wien
+POST /api/radio/play?url=http://...
+POST /api/radio/stop
+POST /api/radio/save?name=...&url=...
+POST /api/radio/delete?name=...
+GET  /api/radio/list
+```
+
+Der Zustand steht auch in `/api/status` unter `radio` — Sender, Abtastrate des
+Streams, empfangene Kilobyte, Aussetzer und Neuverbindungen.
+
+---
+
 ## Mehrere VoiceDots im Haus
 
 Stehen zwei Geräte in benachbarten Räumen, hören beide dasselbe Stichwort — eines
@@ -317,6 +375,11 @@ Umstellung keine doppelte oder fehlende Stunde.
 - Die Aushandlung zwischen mehreren Geräten braucht Subnetz-Broadcast im selben
   Netz; über VLAN-Grenzen hinweg funktioniert sie nicht.
 - OGG/Opus wird nicht dekodiert — in HA MP3 oder WAV als TTS-Format wählen.
+- Radio nur als MP3-Stream: AAC und HLS kann der Helix-Decoder nicht. Auch
+  Shoutcast-Server, die mit `ICY 200 OK` statt einer HTTP-Statuszeile
+  antworten, werden abgelehnt.
+- Radio klingt dumpf: 16 kHz Ausgabe sind der Preis dafür, dass das Stichwort
+  während der Musik gehört werden kann.
 - HTTPS zu Home Assistant läuft mit `setInsecure()`, das Zertifikat wird nicht
   geprüft.
 - **Die API ist unauthentifiziert** — inklusive OTA. VoiceDot gehört in ein

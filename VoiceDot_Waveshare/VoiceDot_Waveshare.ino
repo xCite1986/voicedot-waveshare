@@ -203,6 +203,18 @@ static constexpr uint32_t MULTI_CLAIM_LOOKBACK_MS = 600;
 // id wins. This is the margin below which two scores count as equal.
 static constexpr float MULTI_SCORE_TIE_DB = 0.5f;
 
+// Web radio. The output is fixed at 16 kHz so the shared I2S clock leaves the
+// wake word detector at the rate it needs - see the radio section for why.
+static constexpr uint32_t RADIO_OUTPUT_RATE = 16000;
+static constexpr size_t RADIO_IN_BUFFER_SIZE = 32768;
+static constexpr uint8_t RADIO_MAX_STATIONS = 20;
+static constexpr uint8_t RADIO_FRAMES_PER_TICK = 4;
+static constexpr uint32_t RADIO_WRITE_TIMEOUT_MS = 8;
+static constexpr uint32_t RADIO_STALL_TIMEOUT_MS = 15000;
+static constexpr uint32_t RADIO_RECONNECT_DELAY_MS = 3000;
+static constexpr uint8_t RADIO_MAX_RECONNECTS = 5;
+static const char *RADIO_STATION_FILE = "/radio.txt";
+
 static const char *SOUND_DIR = "/snd";
 static constexpr size_t SOUND_MAX_BYTES = 512 * 1024;
 static constexpr uint8_t SOUND_MAX_FILES = 20;
@@ -424,6 +436,47 @@ uint32_t arbLastClaimAt = 0;
 // detector's meter so it is already known the moment the word is recognised.
 float srRecentPeakDb = -96.0f;
 
+// Radio state. Plain globals rather than a struct: Arduino puts its generated
+// prototypes above the type definitions, so a struct in a signature would not
+// compile.
+bool radioActive = false;
+bool radioPausedForTurn = false;
+String radioStationName = "";
+String radioStationUrl = "";
+String radioStatus = "aus";
+uint32_t radioStartedAt = 0;
+uint32_t radioBytesIn = 0;
+uint32_t radioLastDataMs = 0;
+uint32_t radioRetryAt = 0;
+uint32_t radioUnderruns = 0;
+uint16_t radioSampleRate = 0;
+uint8_t radioChannels = 0;
+uint8_t radioReconnects = 0;
+
+HTTPClient *radioHttp = nullptr;
+WiFiClient *radioPlain = nullptr;
+WiFiClientSecure *radioSecure = nullptr;
+Client *radioStream = nullptr;
+
+uint8_t *radioInBuf = nullptr;
+size_t radioInLen = 0;
+int16_t *radioPcm = nullptr;
+int16_t *radioOut = nullptr;
+size_t radioOutFrames = 0;
+size_t radioOutOffset = 0;
+
+// Box-filter decimator down to RADIO_OUTPUT_RATE.
+uint32_t radioResampRate = 0;
+uint32_t radioResampStep = 0;
+uint32_t radioResampPhase = 0;
+int32_t radioAccL = 0;
+int32_t radioAccR = 0;
+uint32_t radioAccN = 0;
+
+String radioStationNames[RADIO_MAX_STATIONS];
+String radioStationUrls[RADIO_MAX_STATIONS];
+uint8_t radioStationCount = 0;
+
 String haPublishStatus = "aus";
 String haEntityId = "";
 uint32_t haPublishAt = 0;
@@ -557,6 +610,7 @@ enum LedPhase {
   LED_PHASE_LISTEN,
   LED_PHASE_THINK,
   LED_PHASE_SPEAK,
+  LED_PHASE_RADIO,
   LED_PHASE_YIELD,
   LED_PHASE_ERROR
 };
@@ -642,6 +696,13 @@ bool playAckSound();
 bool playSoundFile(const String &name);
 static String multiOwnId();
 static float multiWakeScore();
+static bool radioHandleVoiceCommand(const String &lower);
+static void radioLoadStations();
+void radioStop(const char *why);
+bool radioStart(const String &name, const String &url);
+void radioTick();
+void radioPauseForTurn();
+void radioResumeAfterTurn();
 uint8_t ackScanClips();
 String stripMarkdownForSpeech(const String &in);
 
@@ -883,6 +944,11 @@ static bool handleLocalVoiceCommand(const String &text) {
 
   // Drop leading punctuation so "Lautstärke 5." and ", lautstärke 5" both work.
   while (lower.length() > 0 && !isalnum((unsigned char)lower[0])) lower.remove(0, 1);
+
+  // Radio is ours as well: the station list lives on this device, so resolving
+  // a name here saves a round trip through a language model that cannot play
+  // music anyway.
+  if (radioHandleVoiceCommand(lower)) return true;
 
   // The command has to *be* the sentence, not appear somewhere inside it.
   // Otherwise "stell die Lautstärke im Wohnzimmer auf 5" would turn this
@@ -4306,6 +4372,7 @@ void runWakeCaptureAndHa() {
   diagLogf("WAKE", "start source=%s", wakeRequestSource);
   wakeBusy = true;
   srPauseDetection();
+  radioPauseForTurn();
   wakeLastState = "wake";
   wakeLastMessage = "Wake erkannt.";
   wakeTranscript = "";
@@ -4347,6 +4414,7 @@ void runWakeCaptureAndHa() {
     // Re-arm only once the answer has finished playing, so the speaker cannot
     // trigger the detector with our own TTS.
     srResumeDetection();
+    radioResumeAfterTurn();
   }
 
   diagLogf("WAKE", "end ok=%u followUp=%u state=%s",
@@ -4491,6 +4559,25 @@ void speakRingTick(uint32_t now, bool force) {
   pixels->show();
 }
 
+// Radio is running: one dim dot walking slowly around the ring. Distinct from
+// listening (whole ring pulsing) and speaking (whole ring breathing), and quiet
+// enough to live with for an hour.
+void radioRingTick(uint32_t now, bool force) {
+  if (!pixels) return;
+  if (!force && (uint32_t)(now - waitRingLastMs) < 220) return;
+  waitRingLastMs = now;
+
+  waitRingPosition = (waitRingPosition + 1) % 7;
+
+  uint8_t r = (uint8_t)((((cfg.listenColor >> 16) & 0xFF) * 35) / 100);
+  uint8_t g = (uint8_t)((((cfg.listenColor >> 8) & 0xFF) * 35) / 100);
+  uint8_t b = (uint8_t)(((cfg.listenColor & 0xFF) * 35) / 100);
+
+  pixels->clear();
+  pixels->setPixelColor(waitRingPosition, pixels->Color(r, g, b));
+  pixels->show();
+}
+
 // Two soft blinks in the listening colour, then the ring goes dark and hands
 // back to the idle dot. Self-terminating, so it never blocks the loop while the
 // other device takes over the conversation.
@@ -4538,6 +4625,7 @@ static const char *ledPhaseName() {
     case LED_PHASE_LISTEN: return "listen";
     case LED_PHASE_THINK:  return "think";
     case LED_PHASE_SPEAK:  return "speak";
+    case LED_PHASE_RADIO:  return "radio";
     case LED_PHASE_YIELD:  return "yield";
     case LED_PHASE_ERROR:  return "error";
     default:               return "idle";
@@ -4558,6 +4646,7 @@ void setLedPhase(LedPhase phase) {
     case LED_PHASE_LISTEN: listenRingTick(millis(), true); break;
     case LED_PHASE_THINK:  waitRingTick(millis(), true); break;
     case LED_PHASE_SPEAK:  speakRingTick(millis(), true); break;
+    case LED_PHASE_RADIO:  radioRingTick(millis(), true); break;
     case LED_PHASE_YIELD:  yieldRingTick(millis(), true); break;
     case LED_PHASE_ERROR:  ledsStatusError(); break;
     default:               ledsStatusIdle(); break;
@@ -4573,6 +4662,7 @@ void ledTick(bool force) {
     case LED_PHASE_LISTEN: listenRingTick(now, force); break;
     case LED_PHASE_THINK:  waitRingTick(now, force); break;
     case LED_PHASE_SPEAK:  speakRingTick(now, force); break;
+    case LED_PHASE_RADIO:  radioRingTick(now, force); break;
     case LED_PHASE_YIELD:  yieldRingTick(now, force); break;
     case LED_PHASE_ERROR:
       if ((uint32_t)(now - ledPhaseSince) > 1600) setLedPhase(LED_PHASE_IDLE);
@@ -5238,6 +5328,35 @@ wieder schlafen. Ist kein zweites Gerät im Netz, entfällt die Wartezeit ganz.
 </section>
 
 <section class="card full">
+<h2>WEBRADIO</h2>
+<div class="pinbox" id="radioNow" style="min-height:26px">-</div>
+<div class="pinbox" id="radioBox" style="min-height:46px">Lade ...</div>
+<div class="actions"><button class="danger" onclick="radioStop()">Radio aus</button></div>
+
+<label>Sender suchen (radio-browser.info)</label>
+<div style="display:flex;gap:8px">
+ <input id="radioQuery" placeholder="Energy Wien" style="flex:1"
+  onkeydown="if(event.key==='Enter'){event.preventDefault();radioSearch();}">
+ <button type="button" class="secondary" onclick="radioSearch()">Suchen</button>
+</div>
+<div class="pinbox" id="radioHits" style="min-height:26px">Noch nicht gesucht.</div>
+
+<label>Sender von Hand eintragen</label>
+<div style="display:flex;gap:8px">
+ <input id="radioName" placeholder="Name" style="flex:1">
+ <input id="radioUrl" placeholder="http://..." style="flex:2">
+ <button type="button" onclick="radioAdd()">Merken</button>
+</div>
+<small class="help">
+Gesprochen mit <b>„Spiele Energy Wien"</b>, beendet mit <b>„Stopp"</b> — beides
+wertet das Gerät selbst aus, ohne Umweg über den Assistenten. Läuft Radio und
+das Stichwort fällt, pausiert die Musik für die Frage und geht danach weiter.
+Nur MP3-Streams, kein AAC. Die Ausgabe läuft mit 16 kHz, damit das Mikrofon
+weiter auf 16 kHz bleibt und die Stichworterkennung mithören kann.
+</small>
+</section>
+
+<section class="card full">
 <h2>KLÄNGE</h2>
 <form id="soundForm">
  <input id="soundFile" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav">
@@ -5656,6 +5775,97 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "\n"
 "function clearLog(){logBuf=[];$('logBox').textContent='';}\n"
 "\n"
+"async function refreshRadio(){\n"
+" try{\n"
+"  const r=await fetch('/api/radio/list',{cache:'no-store'});\n"
+"  const j=await r.json();\n"
+"  $('radioNow').textContent=j.active?('LAEUFT   '+j.station+'   ('+j.status+')'):'AUS';\n"
+"  const box=$('radioBox');\n"
+"  box.innerHTML='';\n"
+"  const st=j.stations||[];\n"
+"  if(!st.length){box.textContent='Noch keine Sender gespeichert.';return;}\n"
+"  st.forEach(x=>{\n"
+"   const row=document.createElement('div');\n"
+"   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0';\n"
+"   const label=document.createElement('span');\n"
+"   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
+"   label.textContent=x.name;\n"
+"   label.title=x.url;\n"
+"   const play=document.createElement('button');\n"
+"   play.type='button';play.className='secondary';play.textContent='Abspielen';\n"
+"   play.onclick=()=>radioPlay(x.name);\n"
+"   const del=document.createElement('button');\n"
+"   del.type='button';del.className='danger';del.textContent='Löschen';\n"
+"   del.onclick=()=>radioDelete(x.name);\n"
+"   row.appendChild(label);row.appendChild(play);row.appendChild(del);\n"
+"   box.appendChild(row);\n"
+"  });\n"
+" }catch(e){}\n"
+"}\n"
+"\n"
+"async function radioPlay(name){\n"
+" const r=await fetch('/api/radio/play?name='+encodeURIComponent(name),{method:'POST'});\n"
+" toast(await r.text());\n"
+" setTimeout(refreshRadio,600);\n"
+"}\n"
+"\n"
+"async function radioStop(){\n"
+" const r=await fetch('/api/radio/stop',{method:'POST'});\n"
+" toast(await r.text());\n"
+" setTimeout(refreshRadio,300);\n"
+"}\n"
+"\n"
+"async function radioDelete(name){\n"
+" if(!confirm(name+' aus der Liste nehmen?'))return;\n"
+" const r=await fetch('/api/radio/delete?name='+encodeURIComponent(name),{method:'POST'});\n"
+" toast(await r.text());\n"
+" refreshRadio();\n"
+"}\n"
+"\n"
+"async function radioSave(name,url){\n"
+" const p=new URLSearchParams();p.set('name',name);p.set('url',url);\n"
+" const r=await fetch('/api/radio/save',{method:'POST',\n"
+"  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
+" toast(await r.text());\n"
+" refreshRadio();\n"
+"}\n"
+"\n"
+"function radioAdd(){\n"
+" const n=$('radioName').value.trim(),u=$('radioUrl').value.trim();\n"
+" if(!n||!u){toast('Name und URL bitte ausfüllen.');return;}\n"
+" radioSave(n,u);$('radioName').value='';$('radioUrl').value='';\n"
+"}\n"
+"\n"
+"// The search runs in the browser, not on the board: radio-browser.info allows\n"
+"// cross origin requests, so the device needs no third party service at all.\n"
+"async function radioSearch(){\n"
+" const q=$('radioQuery').value.trim();\n"
+" const box=$('radioHits');\n"
+" if(!q){box.textContent='Bitte einen Suchbegriff eingeben.';return;}\n"
+" box.textContent='Suche ...';\n"
+" try{\n"
+"  const u='https://de1.api.radio-browser.info/json/stations/search?hidebroken=true&limit=12&order=votes&reverse=true&name='+encodeURIComponent(q);\n"
+"  const r=await fetch(u,{headers:{'Accept':'application/json'}});\n"
+"  const j=await r.json();\n"
+"  const mp3=j.filter(x=>(x.codec||'').toUpperCase()==='MP3'&&x.url_resolved);\n"
+"  box.innerHTML='';\n"
+"  if(!mp3.length){box.textContent='Keine MP3-Sender gefunden. AAC kann das Gerät nicht dekodieren.';return;}\n"
+"  mp3.forEach(x=>{\n"
+"   const row=document.createElement('div');\n"
+"   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0';\n"
+"   const label=document.createElement('span');\n"
+"   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
+"   label.textContent=x.name.trim()+'  ('+(x.bitrate||'?')+' kbps'+(x.country?', '+x.country:'')+')';\n"
+"   label.title=x.url_resolved;\n"
+"   const add=document.createElement('button');\n"
+"   add.type='button';add.textContent='Merken';\n"
+"   add.onclick=()=>radioSave(x.name.trim(),x.url_resolved);\n"
+"   row.appendChild(label);row.appendChild(add);\n"
+"   box.appendChild(row);\n"
+"  });\n"
+" }catch(e){box.textContent='Suche fehlgeschlagen: '+e;}\n"
+"}\n"
+"\n"
 "async function refreshSounds(){\n"
 " try{\n"
 "  const r=await fetch('/api/sound/list',{cache:'no-store'});\n"
@@ -5775,6 +5985,8 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "refreshStatus();\n"
 "refreshLog();\n"
 "refreshSounds();\n"
+"refreshRadio();\n"
+"setInterval(refreshRadio,5000);\n"
 "setInterval(refreshStatus,3000);\n"
 "setInterval(refreshLog,1500);\n"
 "\n"
@@ -5952,6 +6164,20 @@ void handleStatus() {
     }
   }
   json += "\"period\":\"" + String(scheduleApplied < 0 ? "-" : (scheduleApplied ? "Nacht" : "Tag")) + "\"";
+  json += "},";
+
+  json += "\"radio\":{";
+  json += "\"active\":" + String(radioActive ? "true" : "false") + ",";
+  json += "\"paused\":" + String(radioPausedForTurn ? "true" : "false") + ",";
+  json += "\"station\":\"" + jsonEscape(radioStationName) + "\",";
+  json += "\"url\":\"" + jsonEscape(radioStationUrl) + "\",";
+  json += "\"status\":\"" + jsonEscape(radioStatus) + "\",";
+  json += "\"rate\":" + String(radioSampleRate) + ",";
+  json += "\"channels\":" + String(radioChannels) + ",";
+  json += "\"kbytes\":" + String(radioBytesIn / 1024UL) + ",";
+  json += "\"underruns\":" + String(radioUnderruns) + ",";
+  json += "\"reconnects\":" + String(radioReconnects) + ",";
+  json += "\"seconds\":" + String(radioActive ? (millis() - radioStartedAt) / 1000UL : 0UL);
   json += "},";
 
   json += "\"multi\":{";
@@ -6824,6 +7050,605 @@ static bool multiArbitrate() {
 }
 
 // -----------------------------------------------------------------------------
+// Web radio
+//
+// Unlike a spoken answer, a radio stream never ends, so this cannot be a
+// function that runs until it is done. It is a state that gets ticked from the
+// main loop: refill the buffer, decode a couple of frames, hand them to I2S,
+// come back next time.
+//
+// The output is resampled to 16 kHz on purpose. TX and RX share one I2S clock,
+// and the wake word detector needs exactly 16 kHz - running the music at its
+// native 44.1 or 48 kHz would drag the microphone along and deafen the
+// detector. This costs treble and buys "Alexa, stopp" while the music plays.
+// -----------------------------------------------------------------------------
+
+// Folds a spoken station name and a stored one onto common ground: lower case,
+// umlauts spelled out, everything else reduced to single spaces.
+static String radioNormalize(const String &in) {
+  String lower = in;
+  lower.toLowerCase();
+
+  String flat;
+  flat.reserve(lower.length() + 4);
+
+  for (size_t i = 0; i < lower.length(); i++) {
+    unsigned char c = (unsigned char)lower[i];
+
+    if (c == 0xC3 && i + 1 < lower.length()) {
+      unsigned char next = (unsigned char)lower[i + 1];
+      i++;
+      if (next == 0xA4 || next == 0x84) flat += "ae";
+      else if (next == 0xB6 || next == 0x96) flat += "oe";
+      else if (next == 0xBC || next == 0x9C) flat += "ue";
+      else if (next == 0x9F) flat += "ss";
+      else flat += ' ';
+      continue;
+    }
+
+    if (isalnum(c)) flat += (char)c;
+    else flat += ' ';
+  }
+
+  String out;
+  out.reserve(flat.length());
+  bool lastWasSpace = true;
+  for (size_t i = 0; i < flat.length(); i++) {
+    if (flat[i] == ' ') {
+      if (!lastWasSpace) out += ' ';
+      lastWasSpace = true;
+    } else {
+      out += flat[i];
+      lastWasSpace = false;
+    }
+  }
+  out.trim();
+  return out;
+}
+
+static void radioLoadStations() {
+  radioStationCount = 0;
+
+  File f = LittleFS.open(RADIO_STATION_FILE, "r");
+  if (!f) return;
+
+  while (f.available() && radioStationCount < RADIO_MAX_STATIONS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int tab = line.indexOf('\t');
+    if (tab <= 0) continue;
+
+    String name = line.substring(0, tab);
+    String url = line.substring(tab + 1);
+    name.trim();
+    url.trim();
+    if (name.length() == 0 || url.length() == 0) continue;
+
+    radioStationNames[radioStationCount] = name;
+    radioStationUrls[radioStationCount] = url;
+    radioStationCount++;
+  }
+
+  f.close();
+}
+
+static bool radioSaveStations() {
+  File f = LittleFS.open(RADIO_STATION_FILE, "w");
+  if (!f) return false;
+
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    f.print(radioStationNames[i]);
+    f.print('\t');
+    f.print(radioStationUrls[i]);
+    f.print('\n');
+  }
+
+  f.close();
+  return true;
+}
+
+// Which station the user meant. An exact hit wins, a contained name is next,
+// and beyond that the station sharing the most words with what was said - so
+// "spiele energy" still finds "ENERGY Wien" when it is the only Energy around.
+static int radioFindStation(const String &spokenNorm) {
+  if (spokenNorm.length() == 0) return -1;
+
+  int best = -1;
+  int bestScore = 0;
+
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    String name = radioNormalize(radioStationNames[i]);
+    if (name.length() == 0) continue;
+
+    int score = 0;
+    if (spokenNorm == name) {
+      score = 10000;
+    } else if (spokenNorm.indexOf(name) >= 0) {
+      score = 5000 + (int)name.length();
+    } else if (name.indexOf(spokenNorm) >= 0) {
+      score = 4000 + (int)spokenNorm.length();
+    } else {
+      String rest = name;
+      while (rest.length() > 0) {
+        int space = rest.indexOf(' ');
+        String word = space < 0 ? rest : rest.substring(0, space);
+        rest = space < 0 ? "" : rest.substring(space + 1);
+        if (word.length() < 3) continue;
+        if (spokenNorm.indexOf(word) >= 0) score += 100;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+
+  return bestScore >= 100 ? best : -1;
+}
+
+static void radioBeginOutput() {
+  setAmplifier(true);
+  es8311SetMute(false);
+  es8311SetVolume(cfg.volume > 0 ? cfg.volume : 60);
+  // Deliberately not scaledPlaybackRate(): the speech tempo setting belongs to
+  // the assistant's voice, not to music.
+  audioSetSampleRate(RADIO_OUTPUT_RATE);
+  audioClearTx();
+}
+
+static void radioEndOutput() {
+  audioClearTx();
+  audioSetSampleRate(AUDIO_SAMPLE_RATE);
+  es8311SetVolume(cfg.volume);
+  if (cfg.volume == 0 || muted) es8311SetMute(true);
+  setAmplifier(false);
+}
+
+static void radioCloseStream() {
+  radioStream = nullptr;
+
+  if (radioHttp) {
+    radioHttp->end();
+    delete radioHttp;
+    radioHttp = nullptr;
+  }
+  if (radioSecure) {
+    delete radioSecure;
+    radioSecure = nullptr;
+  }
+  if (radioPlain) {
+    delete radioPlain;
+    radioPlain = nullptr;
+  }
+
+  radioInLen = 0;
+  radioOutFrames = 0;
+  radioOutOffset = 0;
+}
+
+static void radioFreeBuffers() {
+  if (radioInBuf) { free(radioInBuf); radioInBuf = nullptr; }
+  if (radioPcm) { free(radioPcm); radioPcm = nullptr; }
+  if (radioOut) { free(radioOut); radioOut = nullptr; }
+}
+
+static bool radioAllocBuffers() {
+  if (radioInBuf && radioPcm && radioOut) return true;
+
+  radioFreeBuffers();
+  radioInBuf = (uint8_t*)ps_malloc(RADIO_IN_BUFFER_SIZE);
+  radioPcm = (int16_t*)ps_malloc(MP3_PCM_MAX_SAMPLES * sizeof(int16_t));
+  radioOut = (int16_t*)ps_malloc(MP3_PCM_MAX_SAMPLES * 2 * sizeof(int16_t));
+
+  if (!radioInBuf || !radioPcm || !radioOut) {
+    radioFreeBuffers();
+    return false;
+  }
+  return true;
+}
+
+void radioStop(const char *why) {
+  if (!radioActive) return;
+
+  radioActive = false;
+  radioPausedForTurn = false;
+  radioCloseStream();
+  MP3Decoder_FreeBuffers();
+  radioFreeBuffers();
+  radioEndOutput();
+
+  radioStatus = "aus";
+  radioStationName = "";
+  radioStationUrl = "";
+  radioSampleRate = 0;
+
+  if (ledPhase == LED_PHASE_RADIO) setLedPhase(LED_PHASE_IDLE);
+  diagLogf("RADIO", "stopped: %s", why ? why : "-");
+}
+
+static bool radioOpenStream() {
+  radioCloseStream();
+
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  radioHttp = new HTTPClient();
+  if (!radioHttp) return false;
+
+  bool ok = false;
+  if (radioStationUrl.startsWith("https://")) {
+    radioSecure = new WiFiClientSecure();
+    if (radioSecure) {
+      radioSecure->setInsecure();
+      ok = radioHttp->begin(*radioSecure, radioStationUrl);
+    }
+  } else {
+    radioPlain = new WiFiClient();
+    if (radioPlain) ok = radioHttp->begin(*radioPlain, radioStationUrl);
+  }
+
+  if (!ok) {
+    radioStatus = "Verbindung fehlgeschlagen";
+    radioCloseStream();
+    return false;
+  }
+
+  // Same reason as the TTS path: we read the socket ourselves, so the stream
+  // must not carry chunked framing. No Icy-MetaData either - the title blocks
+  // would land in the middle of the audio and the decoder would choke on them.
+  radioHttp->useHTTP10(true);
+  radioHttp->setTimeout(8000);
+  radioHttp->setReuse(false);
+  radioHttp->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  radioHttp->addHeader("User-Agent", String("VoiceDot/") + FW_VERSION);
+  radioHttp->addHeader("Accept", "audio/mpeg,audio/mp3,*/*");
+
+  int code = radioHttp->GET();
+  if (code != HTTP_CODE_OK) {
+    radioStatus = "HTTP " + String(code);
+    diagLogf("RADIO", "GET failed code=%d url=%s", code, radioStationUrl.c_str());
+    radioCloseStream();
+    return false;
+  }
+
+  if (!MP3Decoder_AllocateBuffers()) {
+    radioStatus = "Decoder-Speicher fehlt";
+    radioCloseStream();
+    return false;
+  }
+
+  radioStream = radioHttp->getStreamPtr();
+  radioInLen = 0;
+  radioOutFrames = 0;
+  radioOutOffset = 0;
+  radioResampRate = 0;
+  radioLastDataMs = millis();
+  radioStatus = "spielt";
+
+  diagLogf("RADIO", "connected %s", radioStationUrl.c_str());
+  return true;
+}
+
+bool radioStart(const String &name, const String &url) {
+  if (url.length() == 0) return false;
+
+  if (!audioI2sReady || !codecPlaybackReady) {
+    radioStatus = "Audio nicht bereit";
+    return false;
+  }
+
+  if (radioActive) radioStop("neuer Sender");
+
+  if (!radioAllocBuffers()) {
+    radioStatus = "Puffer-Speicher fehlt";
+    diagLog("RADIO", "no memory for the stream buffers");
+    return false;
+  }
+
+  radioStationName = name.length() > 0 ? name : url;
+  radioStationUrl = url;
+  radioActive = true;
+  radioPausedForTurn = false;
+  radioStartedAt = millis();
+  radioBytesIn = 0;
+  radioUnderruns = 0;
+  radioReconnects = 0;
+  radioRetryAt = 0;
+  radioStatus = "verbindet";
+
+  radioBeginOutput();
+
+  if (!radioOpenStream()) {
+    // Keep the state and let the tick retry: a station that is busy for a
+    // moment should not need a second voice command.
+    radioRetryAt = millis() + RADIO_RECONNECT_DELAY_MS;
+  }
+
+  setLedPhase(LED_PHASE_RADIO);
+  diagLogf("RADIO", "start \"%s\" %s", radioStationName.c_str(), url.c_str());
+  return true;
+}
+
+// A live stream cannot be paused, so during an assist turn the socket stays
+// open and the bytes are thrown away. Catching up afterwards would only build
+// a delay that never goes away.
+void radioPauseForTurn() {
+  if (!radioActive || radioPausedForTurn) return;
+
+  radioPausedForTurn = true;
+  radioInLen = 0;
+  radioOutFrames = 0;
+  radioOutOffset = 0;
+  MP3Decoder_FreeBuffers();
+  diagLog("RADIO", "paused for the assist turn");
+}
+
+void radioResumeAfterTurn() {
+  if (!radioActive || !radioPausedForTurn) return;
+
+  radioPausedForTurn = false;
+  if (!MP3Decoder_AllocateBuffers()) {
+    radioStop("Decoder-Speicher fehlt nach der Runde");
+    return;
+  }
+
+  if (radioStream) {
+    uint8_t sink[512];
+    uint8_t guard = 0;
+    while (radioStream->available() > 0 && guard++ < 64) {
+      radioStream->read(sink, sizeof(sink));
+    }
+  }
+
+  radioResampRate = 0;
+  radioLastDataMs = millis();
+  radioBeginOutput();
+  setLedPhase(LED_PHASE_RADIO);
+  diagLog("RADIO", "resumed");
+}
+
+// Box-filter decimation down to 16 kHz. Averaging every input sample that
+// falls into an output slot is both the resampler and the anti-alias filter,
+// which is as much as this speaker deserves.
+static void radioResampleFrame(const int16_t *pcm, int samples, int channels, int rate) {
+  if ((uint32_t)rate != radioResampRate) {
+    radioResampRate = (uint32_t)rate;
+    radioResampStep = (uint32_t)(((uint64_t)rate << 16) / RADIO_OUTPUT_RATE);
+    if (radioResampStep == 0) radioResampStep = 65536;
+    radioResampPhase = 0;
+    radioAccL = 0;
+    radioAccR = 0;
+    radioAccN = 0;
+  }
+
+  int frames = channels == 2 ? samples / 2 : samples;
+  size_t out = 0;
+
+  for (int i = 0; i < frames; i++) {
+    int32_t l = channels == 2 ? pcm[i * 2] : pcm[i];
+    int32_t r = channels == 2 ? pcm[i * 2 + 1] : pcm[i];
+
+    radioAccL += l;
+    radioAccR += r;
+    radioAccN++;
+    radioResampPhase += 65536;
+
+    if (radioResampPhase >= radioResampStep && radioAccN > 0) {
+      radioResampPhase -= radioResampStep;
+      radioOut[out * 2] = (int16_t)(radioAccL / (int32_t)radioAccN);
+      radioOut[out * 2 + 1] = (int16_t)(radioAccR / (int32_t)radioAccN);
+      out++;
+      radioAccL = 0;
+      radioAccR = 0;
+      radioAccN = 0;
+    }
+  }
+
+  radioOutFrames = out;
+  radioOutOffset = 0;
+}
+
+// Writes what is pending straight to I2S, deliberately with a short timeout:
+// a full DMA means we are ahead of real time and the rest can wait for the
+// next tick. Not audioWrite(), because a short write is normal here and would
+// otherwise log an error every few milliseconds.
+static bool radioFlushOutput() {
+  while (radioOutOffset < radioOutFrames) {
+    size_t remaining = (radioOutFrames - radioOutOffset) * 2 * sizeof(int16_t);
+    size_t written = 0;
+
+    esp_err_t err = i2s_channel_write(audioTxChan,
+                                      radioOut + radioOutOffset * 2,
+                                      remaining,
+                                      &written,
+                                      RADIO_WRITE_TIMEOUT_MS);
+
+    if (written > 0) radioOutOffset += written / (2 * sizeof(int16_t));
+    if (err != ESP_OK || written < remaining) return false;
+  }
+
+  radioOutFrames = 0;
+  radioOutOffset = 0;
+  return true;
+}
+
+void radioTick() {
+  if (!radioActive) return;
+
+  if (apMode || WiFi.status() != WL_CONNECTED) {
+    radioStop("kein WLAN");
+    return;
+  }
+
+  // The assistant owns the speaker while a turn runs.
+  if (wakeBusy || ttsPlaybackActive || speakerTestActive) {
+    radioPauseForTurn();
+  }
+
+  if (!radioStream) {
+    if ((int32_t)(millis() - radioRetryAt) < 0) return;
+    if (!radioOpenStream()) {
+      radioReconnects++;
+      radioRetryAt = millis() + RADIO_RECONNECT_DELAY_MS;
+      if (radioReconnects > RADIO_MAX_RECONNECTS) radioStop("Sender nicht erreichbar");
+      return;
+    }
+  }
+
+  int available = radioStream->available();
+  while (available > 0 && radioInLen < RADIO_IN_BUFFER_SIZE) {
+    size_t room = RADIO_IN_BUFFER_SIZE - radioInLen;
+    size_t want = min<size_t>(room, min<size_t>((size_t)available, 4096));
+    int got = radioStream->read(radioInBuf + radioInLen, want);
+    if (got <= 0) break;
+    radioInLen += (size_t)got;
+    radioBytesIn += (uint32_t)got;
+    radioLastDataMs = millis();
+    available = radioStream->available();
+  }
+
+  if ((uint32_t)(millis() - radioLastDataMs) > RADIO_STALL_TIMEOUT_MS) {
+    diagLogf("RADIO", "stream stalled for %lu ms, reconnecting",
+             (unsigned long)(millis() - radioLastDataMs));
+    radioCloseStream();
+    MP3Decoder_FreeBuffers();
+    radioReconnects++;
+    radioRetryAt = millis() + RADIO_RECONNECT_DELAY_MS;
+    radioStatus = "verbindet neu";
+    if (radioReconnects > RADIO_MAX_RECONNECTS) radioStop("Sender antwortet nicht mehr");
+    return;
+  }
+
+  if (radioPausedForTurn) {
+    radioInLen = 0;  // stay live instead of playing the backlog later
+    return;
+  }
+
+  if (ledPhase == LED_PHASE_IDLE) setLedPhase(LED_PHASE_RADIO);
+
+  if (!radioFlushOutput()) return;
+
+  for (uint8_t frame = 0; frame < RADIO_FRAMES_PER_TICK; frame++) {
+    if (radioInLen < 1024) {
+      radioUnderruns++;
+      return;
+    }
+
+    int sync = MP3FindSyncWord(radioInBuf, radioInLen);
+    if (sync < 0) {
+      // Nothing usable in here; keep the tail in case a header straddles it.
+      if (radioInLen > 512) {
+        memmove(radioInBuf, radioInBuf + radioInLen - 512, 512);
+        radioInLen = 512;
+      }
+      return;
+    }
+    if (sync > 0) {
+      memmove(radioInBuf, radioInBuf + sync, radioInLen - sync);
+      radioInLen -= sync;
+    }
+
+    int before = (int)radioInLen;
+    int left = before;
+    int err = MP3Decode(radioInBuf, &left, radioPcm, 0);
+    int consumed = before - left;
+    if (consumed > 0 && left >= 0) {
+      memmove(radioInBuf, radioInBuf + consumed, left);
+      radioInLen = (size_t)left;
+    }
+
+    if (err == ERR_MP3_INDATA_UNDERFLOW) {
+      radioUnderruns++;
+      return;
+    }
+
+    if (err != ERR_MP3_NONE && err != ERR_MP3_MAINDATA_UNDERFLOW) {
+      if (consumed <= 0 && radioInLen > 1) {
+        memmove(radioInBuf, radioInBuf + 1, radioInLen - 1);
+        radioInLen--;
+      }
+      continue;
+    }
+
+    int rate = MP3GetSampRate();
+    int channels = MP3GetChannels();
+    int samples = MP3GetOutputSamps();
+    if (rate < 8000 || rate > 48000 || (channels != 1 && channels != 2) ||
+        samples <= 0 || samples > (int)MP3_PCM_MAX_SAMPLES) {
+      continue;
+    }
+
+    if ((uint16_t)rate != radioSampleRate) {
+      radioSampleRate = (uint16_t)rate;
+      radioChannels = (uint8_t)channels;
+      diagLogf("RADIO", "stream %d Hz %d ch -> %lu Hz out",
+               rate, channels, (unsigned long)RADIO_OUTPUT_RATE);
+    }
+
+    radioResampleFrame(radioPcm, samples, channels, rate);
+    if (!radioFlushOutput()) return;
+  }
+}
+
+// "Spiele Energy Wien" and "Stopp" are ours: the station list lives on this
+// device, so resolving the name here saves a round trip through the assistant.
+static bool radioHandleVoiceCommand(const String &lower) {
+  uint8_t words = 1;
+  for (size_t i = 0; i < lower.length(); i++) {
+    if (lower[i] == ' ') words++;
+  }
+  if (words > 8) return false;
+
+  String norm = radioNormalize(lower);
+
+  if (radioActive) {
+    if (norm == "stopp" || norm == "stop" || norm == "aus" || norm == "halt" ||
+        norm == "ruhe" || norm == "radio aus" || norm == "radio stopp" ||
+        norm == "radio stop" || norm == "musik aus" || norm == "musik stopp" ||
+        norm == "stopp radio" || norm == "hoer auf" || norm == "sei still") {
+      String was = radioStationName;
+      radioStop("Sprachbefehl");
+      wakeLastMessage = "Radio " + was + " gestoppt.";
+      return true;
+    }
+  }
+
+  const char *prefixes[] = {"spiele radio ", "spiel radio ", "starte radio ",
+                            "spiele ", "spiel ", "spielen sie ", "radio "};
+  String wanted = "";
+  for (uint8_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    String prefix = prefixes[i];
+    if (norm.startsWith(prefix)) {
+      wanted = norm.substring(prefix.length());
+      break;
+    }
+  }
+  if (wanted.length() == 0) return false;
+
+  wanted.trim();
+  if (wanted.length() < 2) return false;
+
+  int index = radioFindStation(wanted);
+  if (index < 0) {
+    // Say so instead of silently handing an unknown station to the assistant,
+    // which would only answer that it cannot play music either.
+    wakeLastMessage = "Sender \"" + wanted + "\" steht nicht in der Liste.";
+    diagLogf("RADIO", "no station matches \"%s\"", wanted.c_str());
+    return false;
+  }
+
+  if (!radioStart(radioStationNames[index], radioStationUrls[index])) {
+    wakeLastMessage = "Radio konnte nicht starten: " + radioStatus;
+    return true;
+  }
+
+  wakeLastMessage = "Radio " + radioStationNames[index] + " gestartet.";
+  return true;
+}
+
+// -----------------------------------------------------------------------------
 // Sound library
 // -----------------------------------------------------------------------------
 
@@ -7242,6 +8067,121 @@ void handleHaTest() {
   }
 }
 
+void handleRadioList() {
+  String json = "{\"active\":" + String(radioActive ? "true" : "false");
+  json += ",\"station\":\"" + jsonEscape(radioStationName) + "\"";
+  json += ",\"status\":\"" + jsonEscape(radioStatus) + "\"";
+  json += ",\"stations\":[";
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"name\":\"" + jsonEscape(radioStationNames[i]) + "\",";
+    json += "\"url\":\"" + jsonEscape(radioStationUrls[i]) + "\"}";
+  }
+  json += "]}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleRadioPlay() {
+  String name = server.arg("name");
+  String url = server.arg("url");
+
+  if (url.length() == 0 && name.length() > 0) {
+    int index = radioFindStation(radioNormalize(name));
+    if (index < 0) {
+      server.send(404, "text/plain; charset=utf-8", "Sender nicht gefunden.");
+      return;
+    }
+    name = radioStationNames[index];
+    url = radioStationUrls[index];
+  }
+
+  if (url.length() == 0) {
+    server.send(400, "text/plain; charset=utf-8", "name oder url fehlt.");
+    return;
+  }
+
+  if (!radioStart(name, url)) {
+    server.send(500, "text/plain; charset=utf-8", "Radio startet nicht: " + radioStatus);
+    return;
+  }
+
+  server.send(200, "text/plain; charset=utf-8", "Radio " + radioStationName + " laeuft.");
+}
+
+void handleRadioStop() {
+  if (!radioActive) {
+    server.send(200, "text/plain; charset=utf-8", "Radio war schon aus.");
+    return;
+  }
+  radioStop("Webinterface");
+  server.send(200, "text/plain; charset=utf-8", "Radio gestoppt.");
+}
+
+void handleRadioSave() {
+  String name = server.arg("name");
+  String url = server.arg("url");
+  name.trim();
+  url.trim();
+
+  if (name.length() == 0 || url.length() == 0) {
+    server.send(400, "text/plain; charset=utf-8", "Name und URL werden gebraucht.");
+    return;
+  }
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    server.send(400, "text/plain; charset=utf-8", "Die URL muss mit http:// oder https:// beginnen.");
+    return;
+  }
+  // Tab is the field separator in the station file.
+  name.replace("\t", " ");
+  url.replace("\t", "");
+
+  int slot = -1;
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    if (radioStationNames[i].equalsIgnoreCase(name)) { slot = i; break; }
+  }
+  if (slot < 0) {
+    if (radioStationCount >= RADIO_MAX_STATIONS) {
+      server.send(507, "text/plain; charset=utf-8",
+                  "Liste voll, es passen " + String(RADIO_MAX_STATIONS) + " Sender.");
+      return;
+    }
+    slot = radioStationCount++;
+  }
+
+  radioStationNames[slot] = name;
+  radioStationUrls[slot] = url;
+
+  if (!radioSaveStations()) {
+    server.send(500, "text/plain; charset=utf-8", "Senderliste konnte nicht gespeichert werden.");
+    return;
+  }
+
+  server.send(200, "text/plain; charset=utf-8", name + " gespeichert.");
+}
+
+void handleRadioDelete() {
+  String name = server.arg("name");
+  int slot = -1;
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    if (radioStationNames[i] == name) { slot = i; break; }
+  }
+  if (slot < 0) {
+    server.send(404, "text/plain; charset=utf-8", "Sender nicht gefunden.");
+    return;
+  }
+
+  for (uint8_t i = slot; i + 1 < radioStationCount; i++) {
+    radioStationNames[i] = radioStationNames[i + 1];
+    radioStationUrls[i] = radioStationUrls[i + 1];
+  }
+  radioStationCount--;
+  radioStationNames[radioStationCount] = "";
+  radioStationUrls[radioStationCount] = "";
+  radioSaveStations();
+
+  server.send(200, "text/plain; charset=utf-8", name + " geloescht.");
+}
+
 void handleLedTest() {
   if (!pixels) {
     server.send(500, "text/plain; charset=utf-8", "LED-Treiber nicht initialisiert.");
@@ -7384,6 +8324,11 @@ void setupWebServer() {
   // HTTP_ANY so a plain browser URL works too:
   //   http://<host>/api/announce?text=Hallo
   server.on("/api/announce", HTTP_ANY, handleAnnounce);
+  server.on("/api/radio/list", HTTP_GET, handleRadioList);
+  server.on("/api/radio/play", HTTP_ANY, handleRadioPlay);
+  server.on("/api/radio/stop", HTTP_ANY, handleRadioStop);
+  server.on("/api/radio/save", HTTP_ANY, handleRadioSave);
+  server.on("/api/radio/delete", HTTP_ANY, handleRadioDelete);
   server.on("/api/sound/list", HTTP_GET, handleSoundList);
   server.on("/api/sound/delete", HTTP_ANY, handleSoundDelete);
   server.on("/api/sound/play", HTTP_ANY, handleSoundPlay);
@@ -7518,6 +8463,9 @@ void setup() {
 
   applySchedule(true);
 
+  radioLoadStations();
+  logPrintf("Radio: %u Sender gespeichert", radioStationCount);
+
   multiBegin();
 
   Serial.println("BOOT: web server");
@@ -7630,6 +8578,8 @@ void loop() {
       }
     }
   }
+
+  radioTick();
 
   if (soundPlayRequest.length() > 0 && !wakeBusy && !ttsPlaybackActive && !speakerTestActive) {
     String name = soundPlayRequest;
