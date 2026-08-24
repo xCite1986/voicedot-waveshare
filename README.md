@@ -51,6 +51,8 @@ Bausteinen.
 - **REST-API** für Ansagen und Lautstärke, plus optionale Zustandsmeldung als
   Entität in Home Assistant.
 - **Serial-Log im Webinterface** — die letzten 200 Zeilen ohne USB-Kabel.
+- **Mehrere VoiceDots** handeln untereinander aus, wer antwortet — der mit dem
+  lauteren Signal führt das Gespräch.
 - **mDNS-Dienst** `_voicedot._tcp` für automatische Erkennung.
 
 ---
@@ -220,6 +222,39 @@ Mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional —
 
 ---
 
+## Mehrere VoiceDots im Haus
+
+Stehen zwei Geräte in benachbarten Räumen, hören beide dasselbe Stichwort — eines
+laut, das andere leise. Ohne Absprache würden beide aufnehmen und beide denselben
+Befehl an Home Assistant schicken.
+
+Deshalb meldet jedes Gerät bei einer Erkennung per UDP-Rundruf (Port 4210), wie
+laut es das Wort aufgenommen hat, und wartet kurz auf Gegenangebote. Das lauteste
+Gerät führt den Dialog, alle anderen legen sich sofort wieder schlafen, ohne
+überhaupt aufzunehmen.
+
+- **Maßstab ist der Abstand zum eigenen Rauschboden**, nicht der rohe Pegel.
+  Ein Gerät in einem lauten Raum gewinnt sonst nur, weil es dort lauter ist.
+- **Gleichstand** (unter 0,5 dB) entscheidet die kleinere Geräte-ID — so kommen
+  alle Geräte ohne Koordinator zum selben Ergebnis.
+- **Wartezeit** 220 ms, einstellbar zwischen 80 und 600 ms. Steht kein zweites
+  Gerät im Netz, entfällt sie ganz; ein einzelner VoiceDot zahlt also nichts
+  dafür.
+- Der Gewinner meldet seinen Sieg sofort, statt die anderen die volle Wartezeit
+  aussitzen zu lassen.
+- Die Geräte melden sich alle 30 s; nach 180 s Funkstille gilt ein Nachbar als
+  weg.
+
+Im Webinterface zeigt die Karte **Mehrere VoiceDots** die eigene ID, den eigenen
+Score, die letzte Entscheidung und die bekannten Nachbarn. Abschalten lässt sich
+das dort ebenfalls.
+
+Voraussetzung ist, dass der Subnetz-Broadcast im WLAN nicht blockiert wird —
+bei getrennten VLANs oder aktivierter Client-Isolation finden sich die Geräte
+nicht.
+
+---
+
 ## Wie eine Runde abläuft
 
 Das Audio wird **gestreamt, nicht gepuffert**: die Assist-Pipeline wird geöffnet,
@@ -274,6 +309,8 @@ Umstellung keine doppelte oder fehlende Stunde.
   gepackte `srmodels.bin`. Ein frei erfundenes Wort trainiert Espressif nur
   kostenpflichtig.
 - Kein Barge-in: während der Antwort hört der Detektor nicht zu.
+- Die Aushandlung zwischen mehreren Geräten braucht Subnetz-Broadcast im selben
+  Netz; über VLAN-Grenzen hinweg funktioniert sie nicht.
 - OGG/Opus wird nicht dekodiert — in HA MP3 oder WAV als TTS-Format wählen.
 - HTTPS zu Home Assistant läuft mit `setInsecure()`, das Zertifikat wird nicht
   geprüft.

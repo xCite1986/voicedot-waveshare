@@ -65,6 +65,7 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <LittleFS.h>
+#include <WiFiUdp.h>
 #include <Adafruit_NeoPixel.h>
 #include <driver/i2s_std.h>
 
@@ -186,6 +187,22 @@ static constexpr uint8_t PIPELINE_MAX = 8;
 // User uploaded sound effects, played from an announcement by writing
 // "[dingdong.mp3] Es hat geläutet." They live next to the acknowledgement
 // clips in LittleFS, in their own directory so the two never collide.
+// Several VoiceDots in one flat hear the same wake word. They agree over UDP
+// broadcast which of them heard it loudest; that one runs the dialogue, the
+// others go back to sleep without recording anything.
+static constexpr uint16_t MULTI_PORT = 4210;
+static constexpr uint16_t MULTI_HELLO_INTERVAL_MS = 30000;
+static constexpr uint32_t MULTI_PEER_TTL_MS = 180000;
+static constexpr uint8_t MULTI_MAX_PEERS = 8;
+
+// A claim that arrived shortly before our own detection still belongs to the
+// same event - the devices never trigger at exactly the same instant.
+static constexpr uint32_t MULTI_CLAIM_LOOKBACK_MS = 600;
+
+// Equal loudness has to resolve the same way on every device, so the smaller
+// id wins. This is the margin below which two scores count as equal.
+static constexpr float MULTI_SCORE_TIE_DB = 0.5f;
+
 static const char *SOUND_DIR = "/snd";
 static constexpr size_t SOUND_MAX_BYTES = 512 * 1024;
 static constexpr uint8_t SOUND_MAX_FILES = 20;
@@ -375,6 +392,38 @@ String pipelineListStatus = "noch nicht abgerufen";
 String haTtsLanguage = "";
 String haTtsVoice = "";
 
+// Peers and the state of one arbitration round.
+struct VoiceDotPeer {
+  String id;
+  String name;
+  String ip;
+  uint32_t lastSeen = 0;
+  float lastScore = -99.0f;
+  bool lastWon = false;
+};
+
+WiFiUDP multiUdp;
+bool multiReady = false;
+VoiceDotPeer multiPeers[MULTI_MAX_PEERS];
+uint8_t multiPeerCount = 0;
+String multiDeviceId = "";
+String multiLastDecision = "-";
+
+bool arbActive = false;
+uint32_t arbStartedAt = 0;
+float arbBestScore = -99.0f;
+String arbBestId = "";
+bool arbLost = false;
+
+// A claim seen just before our own detection still counts.
+String arbLastClaimId = "";
+float arbLastClaimScore = -99.0f;
+uint32_t arbLastClaimAt = 0;
+
+// Loudness of the wake word: peak level over the last ~1.5 s, held by the
+// detector's meter so it is already known the moment the word is recognised.
+float srRecentPeakDb = -96.0f;
+
 String haPublishStatus = "aus";
 String haEntityId = "";
 uint32_t haPublishAt = 0;
@@ -563,6 +612,8 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  bool multiEnabled;    // arbitrate the wake word with other VoiceDots
+  uint16_t multiWindowMs; // how long to wait for competing claims
 };
 
 Config cfg;
@@ -582,6 +633,8 @@ static uint16_t hhMmToMinutes(const String &value, uint16_t fallback);
 static void applySchedule(bool force);
 bool playAckSound();
 bool playSoundFile(const String &name);
+static String multiOwnId();
+static float multiWakeScore();
 uint8_t ackScanClips();
 String stripMarkdownForSpeech(const String &in);
 
@@ -1070,6 +1123,8 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.multiEnabled = prefs.getBool("multi_on", true);
+  cfg.multiWindowMs = constrain(prefs.getUShort("multi_win", 220), 80, 600);
   cfg.timezone = prefs.getString("tz", DEFAULT_TIMEZONE);
   if (cfg.timezone.isEmpty()) cfg.timezone = DEFAULT_TIMEZONE;
   cfg.ackPhrases = prefs.getString("ack_phrases", ACK_DEFAULT_PHRASES);
@@ -1116,6 +1171,8 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putBool("multi_on", cfg.multiEnabled);
+  prefs.putUShort("multi_win", cfg.multiWindowMs);
   prefs.putString("tz", cfg.timezone);
   prefs.putString("ack_phrases", cfg.ackPhrases);
   prefs.putString("ha_tts_eng", haTtsEngine);
@@ -1753,6 +1810,12 @@ void pollMicLevel() {
 
   if (srRoomNoiseDb > VAD_NOISE_FLOOR_MAX_DB) srRoomNoiseDb = VAD_NOISE_FLOOR_MAX_DB;
   srRoomNoiseAt = millis();
+
+  // Rises instantly, falls about 30 dB in a second and a half, so the peak of
+  // the wake word is still standing when the detector reports it.
+  if (micDb > srRecentPeakDb) srRecentPeakDb = micDb;
+  else srRecentPeakDb -= 1.2f;
+  if (srRecentPeakDb < -96.0f) srRecentPeakDb = -96.0f;
 }
 
 // -----------------------------------------------------------------------------
@@ -1823,6 +1886,12 @@ static void srUpdateMeter(const int16_t *samples, size_t count) {
 
   if (srRoomNoiseDb > VAD_NOISE_FLOOR_MAX_DB) srRoomNoiseDb = VAD_NOISE_FLOOR_MAX_DB;
   srRoomNoiseAt = millis();
+
+  // Rises instantly, falls about 30 dB in a second and a half, so the peak of
+  // the wake word is still standing when the detector reports it.
+  if (micDb > srRecentPeakDb) srRecentPeakDb = micDb;
+  else srRecentPeakDb -= 1.2f;
+  if (srRecentPeakDb < -96.0f) srRecentPeakDb = -96.0f;
 }
 
 // Reads the microphone and hands frames to the AFE.
@@ -5093,6 +5162,24 @@ spielt VoiceDot einen kurzen Zweiklang.
 </section>
 
 <section class="card full">
+<h2>MEHRERE VOICEDOTS</h2>
+<div class="toggle">
+ <input id="multi_enabled" type="checkbox" checked>
+ <label for="multi_enabled" style="margin:0">Bei mehreren Geräten aushandeln, wer antwortet</label>
+</div>
+<label>Wartezeit für Gegenangebote</label>
+<input id="multi_window_ms" type="range" min="80" max="600" step="20" value="220"
+ oninput="multiLabel.textContent=this.value+' ms'">
+<small id="multiLabel" class="help">220 ms</small>
+<div class="pinbox" id="multiBox" style="min-height:46px">...</div>
+<small class="help">
+Hören mehrere VoiceDots dasselbe Stichwort, meldet jeder per UDP-Rundruf, wie laut
+er es aufgenommen hat. Der lauteste führt das Gespräch, die anderen legen sich
+wieder schlafen. Ist kein zweites Gerät im Netz, entfällt die Wartezeit ganz.
+</small>
+</section>
+
+<section class="card full">
 <h2>KLÄNGE</h2>
 <form id="soundForm">
  <input id="soundFile" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav">
@@ -5262,6 +5349,15 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   (sc.time_valid?'':' (noch keine NTP-Zeit)')+(sc.rtc?' · RTC vorhanden':'')+\n"
 "   ' · aktuelles Profil: '+(sc.period||'-');\n"
 "\n"
+"  const mu=j.multi||{};\n"
+"  const peers=mu.peers||[];\n"
+"  $('multiBox').textContent=\n"
+"   'EIGENE ID    '+(mu.id||'-')+'\\n'+\n"
+"   'STATUS       '+(mu.enabled?(mu.ready?'aktiv':'UDP nicht bereit'):'aus')+'\\n'+\n"
+"   'MEIN SCORE   '+(mu.score??0).toFixed(1)+' dB  (Spitze '+(mu.peak_db??0).toFixed(1)+' dBFS)\\n'+\n"
+"   'LETZTE RUNDE '+(mu.decision||'-')+'\\n'+\n"
+"   'NACHBARN     '+(peers.length?peers.map(x=>(x.name||x.id)+' ('+x.ip+', '+x.age_s+' s)').join(', '):'keine');\n"
+"\n"
 "  const hs=j.ha_state||{};\n"
 "  $('haStateBox').textContent=hs.enabled\n"
 "   ?('Entität: '+(hs.entity||'-')+' · '+(hs.status||'-'))\n"
@@ -5325,6 +5421,9 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('silLabel').textContent=($('vad_silence_ms').value/1000).toFixed(1)+' s';\n"
 " $('follow_up').checked=j.follow_up!==false;\n"
 " $('clean_markdown').checked=j.clean_markdown!==false;\n"
+" $('multi_enabled').checked=j.multi_enabled!==false;\n"
+" $('multi_window_ms').value=j.multi_window_ms??220;\n"
+" $('multiLabel').textContent=$('multi_window_ms').value+' ms';\n"
 " $('wake_word').checked=j.wake_word!==false;\n"
 " $('ack_enabled').checked=j.ack_enabled!==false;\n"
 " $('schedule_enabled').checked=!!j.schedule_enabled;\n"
@@ -5367,6 +5466,8 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
 " p.set('clean_markdown',$('clean_markdown').checked?'1':'0');\n"
+" p.set('multi_enabled',$('multi_enabled').checked?'1':'0');\n"
+" p.set('multi_window_ms',$('multi_window_ms').value);\n"
 " p.set('wake_word',$('wake_word').checked?'1':'0');\n"
 " p.set('wake_model',$('wake_model').value);\n"
 " p.set('ack_enabled',$('ack_enabled').checked?'1':'0');\n"
@@ -5789,6 +5890,31 @@ void handleStatus() {
   json += "\"period\":\"" + String(scheduleApplied < 0 ? "-" : (scheduleApplied ? "Nacht" : "Tag")) + "\"";
   json += "},";
 
+  json += "\"multi\":{";
+  json += "\"enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
+  json += "\"ready\":" + String(multiReady ? "true" : "false") + ",";
+  json += "\"id\":\"" + jsonEscape(multiOwnId()) + "\",";
+  json += "\"window_ms\":" + String(cfg.multiWindowMs) + ",";
+  json += "\"score\":" + String(multiWakeScore(), 1) + ",";
+  json += "\"peak_db\":" + String(srRecentPeakDb, 1) + ",";
+  json += "\"decision\":\"" + jsonEscape(multiLastDecision) + "\",";
+  json += "\"peers\":[";
+  {
+    bool first = true;
+    for (uint8_t i = 0; i < multiPeerCount; i++) {
+      uint32_t age = millis() - multiPeers[i].lastSeen;
+      if (age >= MULTI_PEER_TTL_MS) continue;
+      if (!first) json += ",";
+      first = false;
+      json += "{\"id\":\"" + jsonEscape(multiPeers[i].id) + "\",";
+      json += "\"name\":\"" + jsonEscape(multiPeers[i].name) + "\",";
+      json += "\"ip\":\"" + jsonEscape(multiPeers[i].ip) + "\",";
+      json += "\"age_s\":" + String(age / 1000UL) + ",";
+      json += "\"last_score\":" + String(multiPeers[i].lastScore, 1) + "}";
+    }
+  }
+  json += "]},";
+
   json += "\"ha_state\":{";
   json += "\"enabled\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"entity\":\"" + jsonEscape(haEntityId) + "\",";
@@ -5859,6 +5985,8 @@ void handleGetConfig() {
   json += "\"timezone\":\"" + jsonEscape(cfg.timezone) + "\",";
   json += "\"ha_publish\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"clean_markdown\":" + String(cfg.cleanMarkdown ? "true" : "false") + ",";
+  json += "\"multi_enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
+  json += "\"multi_window_ms\":" + String(cfg.multiWindowMs) + ",";
   json += "\"hostname\":\"" + jsonEscape(deviceHostname()) + "\"";
   json += "}";
 
@@ -5980,6 +6108,15 @@ void handlePostConfig() {
   if (server.hasArg("night_brightness")) {
     cfg.nightBrightness = constrain(server.arg("night_brightness").toInt(), 0, LED_BRIGHTNESS_MAX);
     scheduleTouched = true;
+  }
+
+  if (server.hasArg("multi_enabled")) {
+    cfg.multiEnabled = server.arg("multi_enabled") == "1" ||
+                       server.arg("multi_enabled") == "true";
+  }
+
+  if (server.hasArg("multi_window_ms")) {
+    cfg.multiWindowMs = constrain(server.arg("multi_window_ms").toInt(), 80, 600);
   }
 
   if (server.hasArg("clean_markdown")) {
@@ -6389,6 +6526,237 @@ static void applySchedule(bool force) {
             period ? "Nacht" : "Tag",
             step, step * 10, brightness,
             minutes / 60, minutes % 60);
+}
+
+// -----------------------------------------------------------------------------
+// Multi-device arbitration
+//
+// Two VoiceDots in adjoining rooms both hear "Alexa" - one loud, one faint -
+// and without coordination both would start recording and both would send the
+// same command to Home Assistant.
+//
+// On detection each device broadcasts a claim carrying how loudly it heard the
+// word, then waits a moment for competing claims. The loudest wins and runs the
+// dialogue; everyone else goes straight back to sleep without recording. Equal
+// loudness is broken by the smaller device id, so every device reaches the same
+// verdict without a coordinator.
+//
+// Devices announce themselves periodically. With no peers around the wait is
+// skipped entirely, so a single VoiceDot pays nothing for this.
+// -----------------------------------------------------------------------------
+
+static String multiOwnId() {
+  if (multiDeviceId.length() == 0) {
+    char id[13];
+    snprintf(id, sizeof(id), "%012llx", (unsigned long long)ESP.getEfuseMac());
+    multiDeviceId = id;
+  }
+  return multiDeviceId;
+}
+
+static void multiBroadcast(const String &payload) {
+  if (!multiReady || WiFi.status() != WL_CONNECTED) return;
+
+  IPAddress bcast = WiFi.localIP();
+  bcast[3] = 255;  // subnet broadcast, quieter than 255.255.255.255
+
+  multiUdp.beginPacket(bcast, MULTI_PORT);
+  multiUdp.write((const uint8_t*)payload.c_str(), payload.length());
+  multiUdp.endPacket();
+}
+
+// Drops peers that have gone quiet, so a device that was switched off stops
+// blocking the shortcut for everyone else.
+static uint8_t multiActivePeers() {
+  uint8_t alive = 0;
+  for (uint8_t i = 0; i < multiPeerCount; i++) {
+    if ((uint32_t)(millis() - multiPeers[i].lastSeen) < MULTI_PEER_TTL_MS) alive++;
+  }
+  return alive;
+}
+
+static VoiceDotPeer *multiFindPeer(const String &id, bool create) {
+  for (uint8_t i = 0; i < multiPeerCount; i++) {
+    if (multiPeers[i].id == id) return &multiPeers[i];
+  }
+
+  if (!create) return nullptr;
+
+  if (multiPeerCount < MULTI_MAX_PEERS) {
+    multiPeers[multiPeerCount].id = id;
+    return &multiPeers[multiPeerCount++];
+  }
+
+  // Table full: recycle whichever entry has been silent the longest.
+  uint8_t oldest = 0;
+  for (uint8_t i = 1; i < multiPeerCount; i++) {
+    if (multiPeers[i].lastSeen < multiPeers[oldest].lastSeen) oldest = i;
+  }
+  multiPeers[oldest] = VoiceDotPeer();
+  multiPeers[oldest].id = id;
+  return &multiPeers[oldest];
+}
+
+// True when `a` should win against `b`. Louder wins; equal loudness is decided
+// by the id so that every device comes to the same conclusion.
+static bool multiScoreWins(float aScore, const String &aId, float bScore, const String &bId) {
+  if (aScore > bScore + MULTI_SCORE_TIE_DB) return true;
+  if (bScore > aScore + MULTI_SCORE_TIE_DB) return false;
+  return aId < bId;
+}
+
+static void multiHandleMessage(const String &msg, const IPAddress &from) {
+  String type = jsonFindString(msg, "t");
+  String id = jsonFindString(msg, "id");
+  if (id.length() == 0 || id == multiOwnId()) return;
+
+  VoiceDotPeer *peer = multiFindPeer(id, true);
+  if (peer) {
+    peer->lastSeen = millis();
+    peer->ip = from.toString();
+    String name = jsonFindString(msg, "name");
+    if (name.length() > 0) peer->name = name;
+  }
+
+  if (type == "hello") return;
+
+  if (type == "claim" || type == "win") {
+    float score = (float)atof(jsonFindString(msg, "score").c_str());
+    if (peer) {
+      peer->lastScore = score;
+      peer->lastWon = (type == "win");
+    }
+
+    arbLastClaimId = id;
+    arbLastClaimScore = score;
+    arbLastClaimAt = millis();
+
+    if (type == "win") {
+      // Somebody already declared themselves the winner. Only yield if they
+      // really are louder - otherwise our own claim still stands.
+      if (arbActive && multiScoreWins(score, id, arbBestScore, arbBestId)) {
+        arbBestScore = score;
+        arbBestId = id;
+        arbLost = true;
+      }
+      return;
+    }
+
+    if (arbActive && multiScoreWins(score, id, arbBestScore, arbBestId)) {
+      arbBestScore = score;
+      arbBestId = id;
+    }
+  }
+}
+
+static void multiPoll() {
+  if (!multiReady) return;
+
+  int size = multiUdp.parsePacket();
+  while (size > 0) {
+    char buf[321];
+    int len = multiUdp.read(buf, sizeof(buf) - 1);
+    if (len > 0) {
+      buf[len] = '\0';
+      multiHandleMessage(String(buf), multiUdp.remoteIP());
+    }
+    size = multiUdp.parsePacket();
+  }
+}
+
+static void multiSendHello() {
+  String msg = "{\"t\":\"hello\",\"id\":\"" + multiOwnId() + "\"";
+  msg += ",\"name\":\"" + jsonEscape(cfg.deviceName) + "\"";
+  msg += ",\"fw\":\"" + String(FW_VERSION) + "\"}";
+  multiBroadcast(msg);
+}
+
+static void multiSendClaim(const char *type, float score) {
+  String msg = "{\"t\":\"" + String(type) + "\",\"id\":\"" + multiOwnId() + "\"";
+  msg += ",\"name\":\"" + jsonEscape(cfg.deviceName) + "\"";
+  msg += ",\"score\":\"" + String(score, 1) + "\"";
+  msg += ",\"peak\":\"" + String(srRecentPeakDb, 1) + "\"";
+  msg += ",\"noise\":\"" + String(srRoomNoiseValid ? srRoomNoiseDb : -96.0f, 1) + "\"}";
+  multiBroadcast(msg);
+}
+
+static void multiBegin() {
+  multiOwnId();
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  multiReady = multiUdp.begin(MULTI_PORT);
+  if (multiReady) {
+    logPrintf("Multi-Dot: UDP %u bereit, id=%s", MULTI_PORT, multiOwnId().c_str());
+    multiSendHello();
+  } else {
+    logPrintf("Multi-Dot: UDP-Port %u konnte nicht geoeffnet werden", MULTI_PORT);
+  }
+}
+
+// How loudly this device heard the wake word, measured against its own room
+// noise. Using the margin over the local noise floor rather than the raw level
+// keeps a noisy room from winning just because it is noisy.
+static float multiWakeScore() {
+  float noise = srRoomNoiseValid ? srRoomNoiseDb : VAD_NOISE_FLOOR_START_DB;
+  return srRecentPeakDb - noise;
+}
+
+// Returns true when this device should run the dialogue.
+static bool multiArbitrate() {
+  if (!cfg.multiEnabled) return true;
+
+  if (!multiReady) {
+    multiBegin();
+    if (!multiReady) return true;
+  }
+
+  float score = multiWakeScore();
+
+  if (multiActivePeers() == 0) {
+    // Nobody else is around, so there is nothing to wait for.
+    multiLastDecision = "allein, Score " + String(score, 1) + " dB";
+    return true;
+  }
+
+  arbActive = true;
+  arbLost = false;
+  arbStartedAt = millis();
+  arbBestScore = score;
+  arbBestId = multiOwnId();
+
+  // A neighbour that triggered a moment earlier has already sent its claim.
+  if (arbLastClaimId.length() > 0 &&
+      (uint32_t)(millis() - arbLastClaimAt) < MULTI_CLAIM_LOOKBACK_MS &&
+      multiScoreWins(arbLastClaimScore, arbLastClaimId, arbBestScore, arbBestId)) {
+    arbBestScore = arbLastClaimScore;
+    arbBestId = arbLastClaimId;
+  }
+
+  multiSendClaim("claim", score);
+
+  while ((uint32_t)(millis() - arbStartedAt) < cfg.multiWindowMs && !arbLost) {
+    multiPoll();
+    delay(2);
+    yield();
+  }
+
+  arbActive = false;
+  bool won = !arbLost && arbBestId == multiOwnId();
+
+  if (won) {
+    // Tell the others straight away instead of making them wait out the window.
+    multiSendClaim("win", score);
+    multiLastDecision = "gewonnen mit " + String(score, 1) + " dB";
+  } else {
+    String name = arbBestId;
+    VoiceDotPeer *peer = multiFindPeer(arbBestId, false);
+    if (peer && peer->name.length() > 0) name = peer->name;
+    multiLastDecision = "abgegeben an " + name + " (" + String(arbBestScore, 1) +
+                        " dB gegen " + String(score, 1) + " dB)";
+  }
+
+  diagLogf("MULTI", "%s", multiLastDecision.c_str());
+  return won;
 }
 
 // -----------------------------------------------------------------------------
@@ -7080,6 +7448,8 @@ void setup() {
 
   applySchedule(true);
 
+  multiBegin();
+
   Serial.println("BOOT: web server");
   setupWebServer();
 
@@ -7154,16 +7524,41 @@ void loop() {
     if (apMode || WiFi.status() != WL_CONNECTED) {
       diagLog("SR", "wake word ignored, no Home Assistant connection");
       wakeLastMessage = "Wake-Word erkannt, aber kein WLAN.";
-    } else if (wakeCanStart()) {
-      requestWake("wakeword");
-    } else {
+    } else if (!wakeCanStart()) {
       diagLog("SR", "wake word ignored, busy or cooling down");
+    } else if (!multiArbitrate()) {
+      // A louder VoiceDot takes this one. Go back to sleep without recording,
+      // and hold off briefly so the tail of the same word cannot retrigger us.
+      wakeLastState = "idle";
+      wakeLastMessage = "Anderer VoiceDot war näher: " + multiLastDecision;
+      wakeIgnoreUntil = millis() + WAKE_COOLDOWN_MS;
+      setLedPhase(LED_PHASE_IDLE);
+    } else {
+      requestWake("wakeword");
     }
   }
 
   if (wakeRequested && wakeCanStart()) {
     wakeRequested = false;
     runWakeCaptureAndHa();
+  }
+
+  if (cfg.multiEnabled && !apMode && WiFi.status() == WL_CONNECTED) {
+    if (!multiReady) {
+      static uint32_t lastMultiRetry = 0;
+      if ((uint32_t)(millis() - lastMultiRetry) > 15000) {
+        lastMultiRetry = millis();
+        multiBegin();
+      }
+    } else {
+      multiPoll();
+
+      static uint32_t lastHello = 0;
+      if ((uint32_t)(millis() - lastHello) > MULTI_HELLO_INTERVAL_MS) {
+        lastHello = millis();
+        multiSendHello();
+      }
+    }
   }
 
   if (soundPlayRequest.length() > 0 && !wakeBusy && !ttsPlaybackActive && !speakerTestActive) {
