@@ -245,9 +245,14 @@ Gerät führt den Dialog, alle anderen legen sich sofort wieder schlafen, ohne
 - Die Geräte melden sich alle 30 s; nach 180 s Funkstille gilt ein Nachbar als
   weg.
 
+Wer verliert, zeigt das auch: der Ring blinkt zweimal weich in der
+Zuhör-Farbe auf und geht dann aus - sichtbares Schlafenlegen, damit man im
+Raum erkennt, welches Gerät gerade übernommen hat.
+
 Im Webinterface zeigt die Karte **Mehrere VoiceDots** die eigene ID, den eigenen
 Score, die letzte Entscheidung und die bekannten Nachbarn. Abschalten lässt sich
-das dort ebenfalls.
+das dort ebenfalls, und **Schlafenlegen zeigen** spielt die Animation einmal ab
+(auch per `POST /api/hardware/led-test?phase=yield`).
 
 Voraussetzung ist, dass der Subnetz-Broadcast im WLAN nicht blockiert wird —
 bei getrennten VLANs oder aktivierter Client-Isolation finden sich die Geräte

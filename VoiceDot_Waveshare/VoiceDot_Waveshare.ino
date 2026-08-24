@@ -557,8 +557,15 @@ enum LedPhase {
   LED_PHASE_LISTEN,
   LED_PHASE_THINK,
   LED_PHASE_SPEAK,
+  LED_PHASE_YIELD,
   LED_PHASE_ERROR
 };
+
+// Losing the arbitration to a louder VoiceDot: two blinks, then dark, then the
+// idle dot again - a visible "you are talking to the other one".
+static constexpr uint32_t LED_YIELD_BLINK_MS = 200;
+static constexpr uint32_t LED_YIELD_GAP_MS = 120;
+static constexpr uint32_t LED_YIELD_TOTAL_MS = 780;
 
 LedPhase ledPhase = LED_PHASE_IDLE;
 uint32_t ledPhaseSince = 0;
@@ -4484,9 +4491,57 @@ void speakRingTick(uint32_t now, bool force) {
   pixels->show();
 }
 
+// Two soft blinks in the listening colour, then the ring goes dark and hands
+// back to the idle dot. Self-terminating, so it never blocks the loop while the
+// other device takes over the conversation.
+void yieldRingTick(uint32_t now, bool force) {
+  if (!pixels) return;
+  if (!force && (uint32_t)(now - waitRingLastMs) < 25) return;
+  waitRingLastMs = now;
+
+  uint32_t elapsed = now - ledPhaseSince;
+  if (elapsed >= LED_YIELD_TOTAL_MS) {
+    setLedPhase(LED_PHASE_IDLE);
+    return;
+  }
+
+  // Sine envelope rather than a hard on/off - the ring fades away instead of
+  // flashing, which reads as backing off rather than as an error.
+  float level = 0.0f;
+  const uint32_t cycle = LED_YIELD_BLINK_MS + LED_YIELD_GAP_MS;
+  if (elapsed < 2 * cycle) {
+    uint32_t inBlink = elapsed % cycle;
+    if (inBlink < LED_YIELD_BLINK_MS) {
+      level = sinf((float)inBlink * PI / (float)LED_YIELD_BLINK_MS);
+    }
+  }
+
+  uint8_t r = (uint8_t)(((cfg.listenColor >> 16) & 0xFF) * level);
+  uint8_t g = (uint8_t)(((cfg.listenColor >> 8) & 0xFF) * level);
+  uint8_t b = (uint8_t)((cfg.listenColor & 0xFF) * level);
+
+  for (uint8_t i = 0; i < 7; i++) {
+    pixels->setPixelColor(i, pixels->Color(r, g, b));
+  }
+  pixels->show();
+}
+
 void ledsStatusIdle() {
   if (apMode) ledsStatusSetup();
   else ledsStatusReady();
+}
+
+// Name of the current ring animation, for the status page and for checking
+// from outside that a self-terminating phase really did terminate.
+static const char *ledPhaseName() {
+  switch (ledPhase) {
+    case LED_PHASE_LISTEN: return "listen";
+    case LED_PHASE_THINK:  return "think";
+    case LED_PHASE_SPEAK:  return "speak";
+    case LED_PHASE_YIELD:  return "yield";
+    case LED_PHASE_ERROR:  return "error";
+    default:               return "idle";
+  }
 }
 
 void setLedPhase(LedPhase phase) {
@@ -4503,6 +4558,7 @@ void setLedPhase(LedPhase phase) {
     case LED_PHASE_LISTEN: listenRingTick(millis(), true); break;
     case LED_PHASE_THINK:  waitRingTick(millis(), true); break;
     case LED_PHASE_SPEAK:  speakRingTick(millis(), true); break;
+    case LED_PHASE_YIELD:  yieldRingTick(millis(), true); break;
     case LED_PHASE_ERROR:  ledsStatusError(); break;
     default:               ledsStatusIdle(); break;
   }
@@ -4517,6 +4573,7 @@ void ledTick(bool force) {
     case LED_PHASE_LISTEN: listenRingTick(now, force); break;
     case LED_PHASE_THINK:  waitRingTick(now, force); break;
     case LED_PHASE_SPEAK:  speakRingTick(now, force); break;
+    case LED_PHASE_YIELD:  yieldRingTick(now, force); break;
     case LED_PHASE_ERROR:
       if ((uint32_t)(now - ledPhaseSince) > 1600) setLedPhase(LED_PHASE_IDLE);
       break;
@@ -5172,6 +5229,7 @@ spielt VoiceDot einen kurzen Zweiklang.
  oninput="multiLabel.textContent=this.value+' ms'">
 <small id="multiLabel" class="help">220 ms</small>
 <div class="pinbox" id="multiBox" style="min-height:46px">...</div>
+<button class="green" onclick="yieldPreview()">Schlafenlegen zeigen</button>
 <small class="help">
 Hören mehrere VoiceDots dasselbe Stichwort, meldet jeder per UDP-Rundruf, wie laut
 er es aufgenommen hat. Der lauteste führt das Gespräch, die anderen legen sich
@@ -5549,6 +5607,11 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('haResult').textContent=await r.text();\n"
 "}\n"
 "\n"
+"async function yieldPreview(){\n"
+" const r=await fetch('/api/hardware/led-test?phase=yield',{method:'POST'});\n"
+" toast(await r.text());\n"
+"}\n"
+"\n"
 "async function ledTest(){\n"
 " const r=await fetch('/api/hardware/led-test',{method:'POST'});\n"
 " toast(await r.text());\n"
@@ -5793,7 +5856,8 @@ void handleStatus() {
   json += "\"es7210\":" + String(es7210Present ? "true" : "false") + ",";
   json += "\"tca9555\":" + String(tca9555Present ? "true" : "false") + ",";
   json += "\"rtc\":" + String(rtcPresent ? "true" : "false") + ",";
-  json += "\"amp_enabled\":" + String(amplifierEnabled ? "true" : "false");
+  json += "\"amp_enabled\":" + String(amplifierEnabled ? "true" : "false") + ",";
+  json += "\"led_phase\":\"" + String(ledPhaseName()) + "\"";
   json += "},";
 
   json += "\"audio\":{";
@@ -7184,6 +7248,12 @@ void handleLedTest() {
     return;
   }
 
+  if (server.arg("phase") == "yield") {
+    setLedPhase(LED_PHASE_YIELD);
+    server.send(200, "text/plain; charset=utf-8", "Zeige das Schlafenlegen.");
+    return;
+  }
+
   // short synchronous diagnostic sequence
   setAllLeds(180, 0, 0); delay(180);
   setAllLeds(0, 180, 0); delay(180);
@@ -7532,7 +7602,7 @@ void loop() {
       wakeLastState = "idle";
       wakeLastMessage = "Anderer VoiceDot war näher: " + multiLastDecision;
       wakeIgnoreUntil = millis() + WAKE_COOLDOWN_MS;
-      setLedPhase(LED_PHASE_IDLE);
+      setLedPhase(LED_PHASE_YIELD);
     } else {
       requestWake("wakeword");
     }
