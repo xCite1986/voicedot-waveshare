@@ -48,6 +48,7 @@ Bausteinen.
   von `**`, Aufzählungszeichen und Co. befreit.
 - **Tag/Nacht-Profil** für Lautstärke und LED-Helligkeit, per NTP und RTC.
 - **Lautstärke per Sprache**: „Lautstärke 5" wird lokal ausgewertet.
+- **Lautstärke nach Umgebungslärm**: läuft der Fön, wird die Antwort lauter.
 - **REST-API** für Ansagen und Lautstärke, plus optionale Zustandsmeldung als
   Entität in Home Assistant.
 - **Serial-Log im Webinterface** — die letzten 200 Zeilen ohne USB-Kabel.
@@ -221,6 +222,45 @@ http://voicedot.local/api/announce?text=[dingdong.mp3] Es hat geläutet.
 
 Mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional —
 `[dingdong.mp3]` allein spielt nur den Klang und spart den TTS-Aufruf.
+
+---
+
+## Lautstärke nach Umgebungslärm
+
+Läuft der Fön oder der 3D-Drucker, geht eine Antwort in normaler Lautstärke
+unter. Der ohnehin laufend gemessene Rauschboden hebt sie deshalb an:
+
+```text
+Rauschboden −74 dBFS (still)        →  keine Anhebung
+Rauschboden −60 dBFS (Drucker)      →  +5 dB
+Rauschboden −50 dBFS (Fön)          →  +10 dB, gedeckelt
+```
+
+Ein Dezibel Raumlärm kostet ein Dezibel Sprachverständlichkeit, also hebt die
+Regel 1:1 an. Verhandelbar ist nur der Deckel — einstellbar zwischen 0 und
+18 dB, voreingestellt 10 dB. Alles unterhalb von −65 dBFS gilt als still und
+bekommt nichts.
+
+Umgesetzt wird die Anhebung als Offset auf das Lautstärkeregister des ES8311,
+das in Halb-Dezibel-Schritten arbeitet. Der Umweg über die Prozentskala würde
+nur zweimal quantisieren.
+
+**Zwei Dinge, die sonst schiefgehen würden:**
+
+- Gemessen wird ausschließlich, solange der eigene Lautsprecher still ist.
+  Sonst misst das Gerät sich selbst und dreht sich hoch, weil es laut ist.
+  Nachgemessen: während das Radio spielt, klettert der Rauschboden des
+  Detektors von −74 auf −63 dBFS, der für die Anhebung verwendete Wert bleibt
+  bei −74,6 dBFS stehen.
+- Angehoben wird nur **Sprache**, nicht Musik. Musik muss nicht verständlich
+  bleiben, und ein Stream, der den Raum misst, den er gerade füllt, würde sich
+  selbst hinterherlaufen.
+
+Bei einer Grundlautstärke über etwa 91 % ist kein voller Hub mehr möglich —
+das Register ist dann schon fast am Anschlag.
+
+Zu finden im Webinterface unter **AUDIO PIPELINE**, direkt unter der
+Rauschboden-Anzeige, samt Live-Anzeige der aktuellen Anhebung.
 
 ---
 

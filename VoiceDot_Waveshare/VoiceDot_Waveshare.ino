@@ -203,6 +203,14 @@ static constexpr uint32_t MULTI_CLAIM_LOOKBACK_MS = 600;
 // id wins. This is the margin below which two scores count as equal.
 static constexpr float MULTI_SCORE_TIE_DB = 0.5f;
 
+// Room noise at or below this counts as quiet and earns no boost. Measured on
+// a real device a silent living room sits around -74 dBFS, a running 3D printer
+// well above -55 dBFS.
+static constexpr float AUTO_VOLUME_QUIET_DB = -65.0f;
+
+// The codec's volume register moves in half-decibel steps.
+static constexpr float ES8311_DB_PER_STEP = 0.5f;
+
 // Web radio. The output is fixed at 16 kHz so the shared I2S clock leaves the
 // wake word detector at the rate it needs - see the radio section for why.
 static constexpr uint32_t RADIO_OUTPUT_RATE = 16000;
@@ -435,6 +443,14 @@ uint32_t arbLastClaimAt = 0;
 // Loudness of the wake word: peak level over the last ~1.5 s, held by the
 // detector's meter so it is already known the moment the word is recognised.
 float srRecentPeakDb = -96.0f;
+
+// The room noise the boost is based on. Kept apart from srRoomNoiseDb because
+// that one keeps tracking while the radio plays, and a loudspeaker measuring
+// itself would only wind itself up.
+float autoVolumeNoiseDb = VAD_NOISE_FLOOR_START_DB;
+bool autoVolumeNoiseValid = false;
+uint32_t autoVolumeNoiseAt = 0;
+float autoVolumeLastBoost = 0.0f;
 
 // Radio state. Plain globals rather than a struct: Arduino puts its generated
 // prototypes above the type definitions, so a struct in a signature would not
@@ -673,6 +689,8 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  bool autoVolumeEnabled;  // lift the voice when the room gets loud
+  uint8_t autoVolumeMaxDb; // how far it may lift it
   bool multiEnabled;    // arbitrate the wake word with other VoiceDots
   uint16_t multiWindowMs; // how long to wait for competing claims
 };
@@ -1196,6 +1214,8 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.autoVolumeEnabled = prefs.getBool("avol_on", true);
+  cfg.autoVolumeMaxDb = constrain(prefs.getUChar("avol_max", 10), 0, 18);
   cfg.multiEnabled = prefs.getBool("multi_on", true);
   cfg.multiWindowMs = constrain(prefs.getUShort("multi_win", 220), 80, 600);
   cfg.timezone = prefs.getString("tz", DEFAULT_TIMEZONE);
@@ -1244,6 +1264,8 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putBool("avol_on", cfg.autoVolumeEnabled);
+  prefs.putUChar("avol_max", cfg.autoVolumeMaxDb);
   prefs.putBool("multi_on", cfg.multiEnabled);
   prefs.putUShort("multi_win", cfg.multiWindowMs);
   prefs.putString("tz", cfg.timezone);
@@ -1465,6 +1487,21 @@ uint8_t es8311VolumeReg(uint8_t percent) {
   return map(percent, 1, 100, 32, 255);
 }
 
+// A boost in decibels is just an offset on the volume register - going through
+// the percent scale would quantise it twice for nothing.
+void es8311SetVolumeBoosted(uint8_t percent, float boostDb) {
+  if (!codecPlaybackReady) return;
+
+  int reg = es8311VolumeReg(percent);
+  if (percent > 0 && boostDb > 0.0f) {
+    reg += (int)lroundf(boostDb / ES8311_DB_PER_STEP);
+    if (reg > 255) reg = 255;
+  }
+
+  codecWrite(ADDR_ES8311, 0x32, (uint8_t)reg);
+  es8311SetMute(percent == 0 || muted);
+}
+
 void es8311SetMute(bool mute) {
   if (!codecPlaybackReady) return;
 
@@ -1640,13 +1677,35 @@ uint32_t scaledPlaybackRate(uint32_t nominal) {
   return scaled;
 }
 
+// How much louder the voice has to be to stay as intelligible as it was in a
+// quiet room. One decibel of room noise costs one decibel of speech, so the
+// mapping is 1:1 - only the ceiling is a matter of taste.
+float autoVolumeBoostDb() {
+  if (!cfg.autoVolumeEnabled || cfg.autoVolumeMaxDb == 0) return 0.0f;
+  if (!autoVolumeNoiseValid) return 0.0f;
+
+  float over = autoVolumeNoiseDb - AUTO_VOLUME_QUIET_DB;
+  if (over <= 0.0f) return 0.0f;
+  if (over > (float)cfg.autoVolumeMaxDb) over = (float)cfg.autoVolumeMaxDb;
+  return over;
+}
+
 bool beginTtsPlayback(uint32_t sampleRate, const char *tag) {
   if (!audioI2sReady || !codecPlaybackReady) return false;
 
   ttsPlaybackActive = true;
   setAmplifier(true);
   es8311SetMute(false);
-  es8311SetVolume(cfg.volume > 0 ? cfg.volume : 60);
+
+  // Speech only. Music gets no boost: it is not the thing that has to stay
+  // understandable, and a stream that measures the room it is filling would
+  // chase its own tail.
+  autoVolumeLastBoost = autoVolumeBoostDb();
+  es8311SetVolumeBoosted(cfg.volume > 0 ? cfg.volume : 60, autoVolumeLastBoost);
+  if (autoVolumeLastBoost > 0.0f) {
+    diagLogf(tag, "auto volume +%.1f dB (Rauschboden %.1f dBFS)",
+             autoVolumeLastBoost, autoVolumeNoiseDb);
+  }
   bool rateOk = audioSetSampleRate(scaledPlaybackRate(sampleRate));
   audioClearTx();
   delay(TTS_AMP_WARMUP_MS);
@@ -5209,6 +5268,23 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
    <div id="threshMark" style="position:absolute;top:-2px;bottom:-2px;width:2px;background:#ffb454;left:0%"></div>
   </div>
   <small id="noiseText" class="help">Rauschboden ...</small>
+
+  <div class="toggle" style="margin-top:10px">
+   <input id="auto_volume" type="checkbox" checked>
+   <label for="auto_volume" style="margin:0">Lautstärke an das Umfeld anpassen</label>
+  </div>
+  <label>Maximale Anhebung</label>
+  <input id="auto_volume_max_db" type="range" min="0" max="18" step="1" value="10"
+   oninput="autoVolLabel.textContent=this.value+' dB'">
+  <small id="autoVolLabel" class="help">10 dB</small>
+  <small id="autoVolText" class="help">-</small>
+  <small class="help">
+  Läuft der Fön oder der 3D-Drucker, geht die gesprochene Antwort im Lärm unter.
+  Der laufend gemessene Rauschboden hebt sie dann an — ein Dezibel Raumlärm
+  kostet ein Dezibel Sprache, gedeckelt auf den eingestellten Wert. Gemessen
+  wird nur, solange der eigene Lautsprecher still ist; Musik wird nicht
+  angehoben.
+  </small>
  </div>
 </div>
 <div class="pinbox" id="pinbox">Lade Pinbelegung ...</div>
@@ -5474,6 +5550,14 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   'Rauschboden '+nf.toFixed(1)+' dBFS · Sprache ab '+sp.toFixed(1)+\n"
 "   ' · Satzende unter '+rl.toFixed(1)+' dBFS';\n"
 "\n"
+"  const av=j.auto_volume||{};\n"
+"  $('autoVolText').textContent=av.enabled\n"
+"   ?('Umfeld '+(av.noise_db??0).toFixed(1)+' dBFS · ruhig bis '+\n"
+"     (av.quiet_db??0).toFixed(1)+' dBFS · Anhebung jetzt +'+\n"
+"     (av.boost_db??0).toFixed(1)+' dB · zuletzt gesprochen +'+\n"
+"     (av.last_boost_db??0).toFixed(1)+' dB')\n"
+"   :'Anpassung aus.';\n"
+"\n"
 "  $('assistBox').textContent=\n"
 "   'STATE       '+(j.assist.state||'-')+'\\n'+\n"
 "   'WS STAGE    '+(j.assist.ws_stage||'-')+'\\n'+\n"
@@ -5598,6 +5682,9 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('silLabel').textContent=($('vad_silence_ms').value/1000).toFixed(1)+' s';\n"
 " $('follow_up').checked=j.follow_up!==false;\n"
 " $('clean_markdown').checked=j.clean_markdown!==false;\n"
+" $('auto_volume').checked=j.auto_volume!==false;\n"
+" $('auto_volume_max_db').value=j.auto_volume_max_db??10;\n"
+" $('autoVolLabel').textContent=$('auto_volume_max_db').value+' dB';\n"
 " $('multi_enabled').checked=j.multi_enabled!==false;\n"
 " $('multi_window_ms').value=j.multi_window_ms??220;\n"
 " $('multiLabel').textContent=$('multi_window_ms').value+' ms';\n"
@@ -5643,6 +5730,8 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
 " p.set('clean_markdown',$('clean_markdown').checked?'1':'0');\n"
+" p.set('auto_volume',$('auto_volume').checked?'1':'0');\n"
+" p.set('auto_volume_max_db',$('auto_volume_max_db').value);\n"
 " p.set('multi_enabled',$('multi_enabled').checked?'1':'0');\n"
 " p.set('multi_window_ms',$('multi_window_ms').value);\n"
 " p.set('wake_word',$('wake_word').checked?'1':'0');\n"
@@ -6166,6 +6255,16 @@ void handleStatus() {
   json += "\"period\":\"" + String(scheduleApplied < 0 ? "-" : (scheduleApplied ? "Nacht" : "Tag")) + "\"";
   json += "},";
 
+  json += "\"auto_volume\":{";
+  json += "\"enabled\":" + String(cfg.autoVolumeEnabled ? "true" : "false") + ",";
+  json += "\"max_db\":" + String(cfg.autoVolumeMaxDb) + ",";
+  json += "\"quiet_db\":" + String(AUTO_VOLUME_QUIET_DB, 1) + ",";
+  json += "\"noise_db\":" + String(autoVolumeNoiseValid ? autoVolumeNoiseDb : -96.0f, 1) + ",";
+  json += "\"boost_db\":" + String(autoVolumeBoostDb(), 1) + ",";
+  json += "\"last_boost_db\":" + String(autoVolumeLastBoost, 1) + ",";
+  json += "\"age_s\":" + String(autoVolumeNoiseValid ? (millis() - autoVolumeNoiseAt) / 1000UL : 0UL);
+  json += "},";
+
   json += "\"radio\":{";
   json += "\"active\":" + String(radioActive ? "true" : "false") + ",";
   json += "\"paused\":" + String(radioPausedForTurn ? "true" : "false") + ",";
@@ -6275,6 +6374,8 @@ void handleGetConfig() {
   json += "\"timezone\":\"" + jsonEscape(cfg.timezone) + "\",";
   json += "\"ha_publish\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"clean_markdown\":" + String(cfg.cleanMarkdown ? "true" : "false") + ",";
+  json += "\"auto_volume\":" + String(cfg.autoVolumeEnabled ? "true" : "false") + ",";
+  json += "\"auto_volume_max_db\":" + String(cfg.autoVolumeMaxDb) + ",";
   json += "\"multi_enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
   json += "\"multi_window_ms\":" + String(cfg.multiWindowMs) + ",";
   json += "\"hostname\":\"" + jsonEscape(deviceHostname()) + "\"";
@@ -6398,6 +6499,15 @@ void handlePostConfig() {
   if (server.hasArg("night_brightness")) {
     cfg.nightBrightness = constrain(server.arg("night_brightness").toInt(), 0, LED_BRIGHTNESS_MAX);
     scheduleTouched = true;
+  }
+
+  if (server.hasArg("auto_volume")) {
+    cfg.autoVolumeEnabled = server.arg("auto_volume") == "1" ||
+                            server.arg("auto_volume") == "true";
+  }
+
+  if (server.hasArg("auto_volume_max_db")) {
+    cfg.autoVolumeMaxDb = constrain(server.arg("auto_volume_max_db").toInt(), 0, 18);
   }
 
   if (server.hasArg("multi_enabled")) {
@@ -8577,6 +8687,15 @@ void loop() {
         multiSendHello();
       }
     }
+  }
+
+  // The noise floor only says something about the room while our own speaker is
+  // quiet. During playback the microphone hears us, not the hairdryer.
+  if (srRoomNoiseValid && !ttsPlaybackActive && !radioActive &&
+      !speakerTestActive && !wakeBusy) {
+    autoVolumeNoiseDb = srRoomNoiseDb;
+    autoVolumeNoiseValid = true;
+    autoVolumeNoiseAt = millis();
   }
 
   radioTick();
