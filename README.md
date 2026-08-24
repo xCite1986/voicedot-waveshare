@@ -342,6 +342,22 @@ deren API erlaubt Cross-Origin-Anfragen, dadurch braucht der VoiceDot selbst
 keinen Fremddienst. Treffer ohne MP3 werden ausgeblendet, weil nur MP3
 dekodiert wird.
 
+### HTTPS-Sender werden ohne TLS versucht
+
+Eine TLS-Verbindung kostet auf diesem Chip rund **43 kB internen RAM** —
+gemessen: 52 kB frei davor, 8,8 kB danach. Das Radio spielt dann zwar weiter,
+aber das Webinterface braucht für jede Seite 25 Sekunden und wirkt tot.
+
+Die meisten Icecast-Server antworten aber auch auf Port 80. Ein `https://`-
+Sender wird deshalb **zuerst ohne TLS versucht** und fällt nur zurück, wenn das
+wirklich nicht geht. Ö3 und TechnoBase.FM etwa sind bei radio-browser.info nur
+mit `https://` eingetragen, laufen hier aber ohne.
+
+Klappt das nicht, wird vor dem Handshake gerechnet statt ihn zu versuchen: ohne
+ausreichenden Speicher wird der Sender in einer halben Sekunde mit klarer
+Meldung abgelehnt. Der Versuch selbst hätte 60 Sekunden gedauert — und das
+Webinterface währenddessen ausgehungert.
+
 ### Warum das Radio mit 16 kHz läuft
 
 TX und RX hängen am selben I2S-Takt. Liefe die Musik mit ihren nativen 44,1
@@ -473,6 +489,9 @@ Umstellung keine doppelte oder fehlende Stunde.
 - Die Aushandlung zwischen mehreren Geräten braucht Subnetz-Broadcast im selben
   Netz; über VLAN-Grenzen hinweg funktioniert sie nicht.
 - OGG/Opus wird nicht dekodiert — in HA MP3 oder WAV als TTS-Format wählen.
+- Sender, die **ausschließlich** über HTTPS erreichbar sind, lassen sich nicht
+  abspielen — für TLS und Stichworterkennung gleichzeitig reicht der interne
+  RAM nicht. Das Gerät sagt das und spielt nichts, statt unerreichbar zu werden.
 - Radio nur als MP3-Stream: AAC und HLS kann der Helix-Decoder nicht. Auch
   Shoutcast-Server, die mit `ICY 200 OK` statt einer HTTP-Statuszeile
   antworten, werden abgelehnt.

@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.8.1";
+static const char* FW_VERSION = "0.8.2";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -229,6 +229,16 @@ static constexpr uint32_t RADIO_STALL_TIMEOUT_MS = 15000;
 static constexpr uint32_t RADIO_RECONNECT_DELAY_MS = 3000;
 static constexpr uint8_t RADIO_MAX_RECONNECTS = 5;
 static const char *RADIO_STATION_FILE = "/radio.txt";
+
+// A TLS session costs about 43 kB of internal RAM on this chip. Measured with
+// an https:// stream running, the web interface still answered - after 25
+// seconds. Below this much free heap the stream is refused instead.
+static constexpr uint32_t RADIO_TLS_MIN_HEAP = 20000;
+
+// What one costs, measured: 52 kB free before, 8.8 kB after. Attempting a
+// handshake that cannot leave enough room is worse than useless - a failing one
+// took 60 seconds, and the web interface was starved for every one of them.
+static constexpr uint32_t RADIO_TLS_HEAP_COST = 43000;
 
 static const char *SOUND_DIR = "/snd";
 static constexpr size_t SOUND_MAX_BYTES = 512 * 1024;
@@ -487,6 +497,7 @@ uint32_t radioUnderruns = 0;
 uint16_t radioSampleRate = 0;
 uint8_t radioChannels = 0;
 uint8_t radioReconnects = 0;
+bool radioUsingTls = false;
 
 HTTPClient *radioHttp = nullptr;
 WiFiClient *radioPlain = nullptr;
@@ -6392,6 +6403,7 @@ void handleStatus() {
   json += "\"status\":\"" + jsonEscape(radioStatus) + "\",";
   json += "\"rate\":" + String(radioSampleRate) + ",";
   json += "\"channels\":" + String(radioChannels) + ",";
+  json += "\"tls\":" + String(radioUsingTls ? "true" : "false") + ",";
   json += "\"kbytes\":" + String(radioBytesIn / 1024UL) + ",";
   json += "\"underruns\":" + String(radioUnderruns) + ",";
   json += "\"reconnects\":" + String(radioReconnects) + ",";
@@ -7881,7 +7893,7 @@ void radioStop(const char *why) {
   diagLogf("RADIO", "stopped: %s", why ? why : "-");
 }
 
-static bool radioOpenStream() {
+static bool radioConnect(const String &url) {
   radioCloseStream();
 
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -7890,15 +7902,17 @@ static bool radioOpenStream() {
   if (!radioHttp) return false;
 
   bool ok = false;
-  if (radioStationUrl.startsWith("https://")) {
+  if (url.startsWith("https://")) {
     radioSecure = new WiFiClientSecure();
     if (radioSecure) {
       radioSecure->setInsecure();
-      ok = radioHttp->begin(*radioSecure, radioStationUrl);
+      // Without this the handshake may sit there for two minutes.
+      radioSecure->setHandshakeTimeout(10);
+      ok = radioHttp->begin(*radioSecure, url);
     }
   } else {
     radioPlain = new WiFiClient();
-    if (radioPlain) ok = radioHttp->begin(*radioPlain, radioStationUrl);
+    if (radioPlain) ok = radioHttp->begin(*radioPlain, url);
   }
 
   if (!ok) {
@@ -7920,7 +7934,7 @@ static bool radioOpenStream() {
   int code = radioHttp->GET();
   if (code != HTTP_CODE_OK) {
     radioStatus = "HTTP " + String(code);
-    diagLogf("RADIO", "GET failed code=%d url=%s", code, radioStationUrl.c_str());
+    diagLogf("RADIO", "GET failed code=%d url=%s", code, url.c_str());
     radioCloseStream();
     return false;
   }
@@ -7939,7 +7953,55 @@ static bool radioOpenStream() {
   radioLastDataMs = millis();
   radioStatus = "spielt";
 
-  diagLogf("RADIO", "connected %s", radioStationUrl.c_str());
+  diagLogf("RADIO", "connected %s (Heap frei: %lu)",
+           url.c_str(), (unsigned long)ESP.getFreeHeap());
+  return true;
+}
+
+// Most Icecast servers answer on plain HTTP as well, and doing without TLS is
+// worth a lot here: it is the difference between a responsive device and one
+// that needs 25 seconds per page. So an https:// station is tried without TLS
+// first, and only falls back when that really does not work.
+static bool radioOpenStream() {
+  radioUsingTls = false;
+
+  if (radioStationUrl.startsWith("https://")) {
+    String plain = "http://" + radioStationUrl.substring(8);
+    if (radioConnect(plain)) {
+      diagLog("RADIO", "served over plain HTTP, no TLS needed");
+      return true;
+    }
+    diagLog("RADIO", "plain HTTP refused, trying TLS");
+
+    uint32_t freeNow = ESP.getFreeHeap();
+    if (freeNow < RADIO_TLS_HEAP_COST + RADIO_TLS_MIN_HEAP) {
+      diagLogf("RADIO", "no TLS attempt, %lu bytes free is not enough",
+               (unsigned long)freeNow);
+      radioStatus = "HTTPS braucht mehr Speicher als frei ist (" +
+                    String(freeNow / 1024) + " kB) - bitte einen http-Stream waehlen";
+      return false;
+    }
+  }
+
+  if (!radioConnect(radioStationUrl)) return false;
+
+  radioUsingTls = radioStationUrl.startsWith("https://");
+  if (!radioUsingTls) return true;
+
+  // A device whose web interface no longer answers looks broken, and the user
+  // has no way of knowing why. Better to say so and play nothing.
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < RADIO_TLS_MIN_HEAP) {
+    diagLogf("RADIO", "TLS stream leaves only %lu bytes of heap, refusing",
+             (unsigned long)freeHeap);
+    radioCloseStream();
+    MP3Decoder_FreeBuffers();
+    radioStatus = "HTTPS braucht mehr Speicher als frei ist (" +
+                  String(freeHeap / 1024) + " kB) - bitte einen http-Stream waehlen";
+    radioUsingTls = false;
+    return false;
+  }
+
   return true;
 }
 
@@ -7973,6 +8035,13 @@ bool radioStart(const String &name, const String &url) {
   radioBeginOutput();
 
   if (!radioOpenStream()) {
+    if (radioStatus.startsWith("HTTPS braucht")) {
+      String why = radioStatus;
+      radioStop("zu wenig Speicher fuer HTTPS");
+      radioStatus = why;
+      diagLogf("RADIO", "start refused: %s", why.c_str());
+      return false;
+    }
     // Keep the state and let the tick retry: a station that is busy for a
     // moment should not need a second voice command.
     radioRetryAt = millis() + RADIO_RECONNECT_DELAY_MS;
@@ -8102,6 +8171,13 @@ void radioTick() {
   if (!radioStream) {
     if ((int32_t)(millis() - radioRetryAt) < 0) return;
     if (!radioOpenStream()) {
+      // Not enough memory is not going to fix itself in three seconds.
+      if (radioStatus.startsWith("HTTPS braucht")) {
+        String why = radioStatus;
+        radioStop("zu wenig Speicher fuer HTTPS");
+        radioStatus = why;
+        return;
+      }
       radioReconnects++;
       radioRetryAt = millis() + RADIO_RECONNECT_DELAY_MS;
       if (radioReconnects > RADIO_MAX_RECONNECTS) radioStop("Sender nicht erreichbar");
