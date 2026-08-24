@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.8.2";
+static const char* FW_VERSION = "0.8.4";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -6407,8 +6407,13 @@ void handleStatus() {
   json += "\"kbytes\":" + String(radioBytesIn / 1024UL) + ",";
   json += "\"underruns\":" + String(radioUnderruns) + ",";
   json += "\"reconnects\":" + String(radioReconnects) + ",";
-  json += "\"seconds\":" + String(radioActive ? (millis() - radioStartedAt) / 1000UL : 0UL);
-  json += "},";
+  json += "\"seconds\":" + String(radioActive ? (millis() - radioStartedAt) / 1000UL : 0UL) + ",";
+  json += "\"stations\":[";
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    if (i > 0) json += ",";
+    json += "\"" + jsonEscape(radioStationNames[i]) + "\"";
+  }
+  json += "]},";
 
   json += "\"multi\":{";
   json += "\"enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
@@ -7758,18 +7763,36 @@ static void radioLoadStations() {
   f.close();
 }
 
+// Written beside the real file and swapped in afterwards. Opening the real one
+// for writing truncates it first, and a write that then fails leaves no list at
+// all - which is what happened once while a TLS stream had eaten the heap.
 static bool radioSaveStations() {
-  File f = LittleFS.open(RADIO_STATION_FILE, "w");
+  static const char *tempFile = "/radio.tmp";
+
+  File f = LittleFS.open(tempFile, "w");
   if (!f) return false;
 
+  size_t written = 0;
   for (uint8_t i = 0; i < radioStationCount; i++) {
-    f.print(radioStationNames[i]);
-    f.print('\t');
-    f.print(radioStationUrls[i]);
-    f.print('\n');
+    written += f.print(radioStationNames[i]);
+    written += f.print('\t');
+    written += f.print(radioStationUrls[i]);
+    written += f.print('\n');
   }
 
   f.close();
+
+  if (radioStationCount > 0 && written == 0) {
+    LittleFS.remove(tempFile);
+    diagLog("RADIO", "station list not written, keeping the old one");
+    return false;
+  }
+
+  LittleFS.remove(RADIO_STATION_FILE);
+  if (!LittleFS.rename(tempFile, RADIO_STATION_FILE)) {
+    diagLog("RADIO", "station list could not be swapped in");
+    return false;
+  }
   return true;
 }
 
