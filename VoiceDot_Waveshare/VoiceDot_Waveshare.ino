@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.7.0";
+static const char* FW_VERSION = "0.8.0";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -202,6 +202,13 @@ static constexpr uint32_t MULTI_CLAIM_LOOKBACK_MS = 600;
 // Equal loudness has to resolve the same way on every device, so the smaller
 // id wins. This is the margin below which two scores count as equal.
 static constexpr float MULTI_SCORE_TIE_DB = 0.5f;
+
+// Firmware updates come from the releases of this repository.
+static const char *UPDATE_REPO = "xCite1986/voicedot-waveshare";
+static constexpr uint8_t UPDATE_MAX_RELEASES = 8;
+static constexpr uint32_t UPDATE_STALL_TIMEOUT_MS = 20000;
+static constexpr uint32_t UPDATE_AUTO_CHECK_MS = 12UL * 60UL * 60UL * 1000UL;
+static constexpr uint32_t UPDATE_FIRST_CHECK_MS = 45000;
 
 // Room noise at or below this counts as quiet and earns no boost. Measured on
 // a real device a silent living room sits around -74 dBFS, a running 3D printer
@@ -443,6 +450,18 @@ uint32_t arbLastClaimAt = 0;
 // Loudness of the wake word: peak level over the last ~1.5 s, held by the
 // detector's meter so it is already known the moment the word is recognised.
 float srRecentPeakDb = -96.0f;
+
+// Cached release list. Everything else reads this instead of asking GitHub, so
+// a polling Home Assistant cannot exhaust the API budget.
+String updateTags[8];
+String updateUrls[8];
+uint8_t updateReleaseCount = 0;
+String updateStatus = "noch nicht geprueft";
+uint32_t updateCheckedAt = 0;
+bool updateChecked = false;
+bool updateInProgress = false;
+int updateProgress = -1;
+String updateRequestedTag = "";
 
 // The room noise the boost is based on. Kept apart from srRoomNoiseDb because
 // that one keeps tracking while the radio plays, and a loudspeaker measuring
@@ -689,6 +708,7 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  bool updateCheckEnabled; // ask GitHub for newer releases on its own
   bool autoVolumeEnabled;  // lift the voice when the room gets loud
   uint8_t autoVolumeMaxDb; // how far it may lift it
   bool multiEnabled;    // arbitrate the wake word with other VoiceDots
@@ -715,6 +735,11 @@ bool playSoundFile(const String &name);
 static String multiOwnId();
 static float multiWakeScore();
 static bool radioHandleVoiceCommand(const String &lower);
+bool updateFetchReleases();
+static int updateNewestIndex();
+static bool updateIsNewer(const String &tag);
+static int updateVersionCompare(const String &a, const String &b);
+static void updateInstall(const String &tag);
 static void radioLoadStations();
 void radioStop(const char *why);
 bool radioStart(const String &name, const String &url);
@@ -1214,6 +1239,7 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.updateCheckEnabled = prefs.getBool("upd_chk", true);
   cfg.autoVolumeEnabled = prefs.getBool("avol_on", true);
   cfg.autoVolumeMaxDb = constrain(prefs.getUChar("avol_max", 10), 0, 18);
   cfg.multiEnabled = prefs.getBool("multi_on", true);
@@ -1264,6 +1290,7 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putBool("upd_chk", cfg.updateCheckEnabled);
   prefs.putBool("avol_on", cfg.autoVolumeEnabled);
   prefs.putUChar("avol_max", cfg.autoVolumeMaxDb);
   prefs.putBool("multi_on", cfg.multiEnabled);
@@ -5404,6 +5431,27 @@ wieder schlafen. Ist kein zweites Gerät im Netz, entfällt die Wartezeit ganz.
 </section>
 
 <section class="card full">
+<h2>FIRMWARE</h2>
+<div class="pinbox" id="updBox" style="min-height:46px">Lade ...</div>
+<div class="actions">
+ <button class="secondary" onclick="updCheck()">Nach Updates suchen</button>
+</div>
+<div class="pinbox" id="updList" style="min-height:26px">-</div>
+<div class="toggle">
+ <input id="update_check" type="checkbox" checked>
+ <label for="update_check" style="margin:0">Selbst bei GitHub nachsehen (alle 12 Stunden)</label>
+</div>
+<small class="help">
+Die Firmware kommt aus den <b>Releases</b> des Projekts auf GitHub. Ausgewählt
+wird hier oder in Home Assistant, geladen und geschrieben wird direkt vom
+Gerät — kein USB-Kabel nötig. Geschrieben wird immer in die gerade nicht
+laufende Partition; geht dabei etwas schief, bleibt die alte Version bestehen.
+Einstellungen, Klänge und Sender überleben das Update, die Wake-Word-Modelle
+liegen in einer eigenen Partition und werden nicht mit angefasst.
+</small>
+</section>
+
+<section class="card full">
 <h2>WEBRADIO</h2>
 <div class="pinbox" id="radioNow" style="min-height:26px">-</div>
 <div class="pinbox" id="radioBox" style="min-height:46px">Lade ...</div>
@@ -5550,6 +5598,36 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   'Rauschboden '+nf.toFixed(1)+' dBFS · Sprache ab '+sp.toFixed(1)+\n"
 "   ' · Satzende unter '+rl.toFixed(1)+' dBFS';\n"
 "\n"
+"  const up=j.update||{};\n"
+"  const rel=up.releases||[];\n"
+"  $('updBox').textContent=\n"
+"   'INSTALLIERT '+(up.installed||'-')+'\\n'+\n"
+"   'VERFUEGBAR  '+(up.latest||'-')+(up.available?'   (neuer)':'')+'\\n'+\n"
+"   'STATUS      '+(up.status||'-')+\n"
+"   (up.checked?'   (vor '+up.age_s+' s geprueft)':'')+\n"
+"   (up.in_progress?'\\nFORTSCHRITT '+up.progress+' %':'');\n"
+"\n"
+"  const ul=$('updList');\n"
+"  ul.innerHTML='';\n"
+"  if(!rel.length){ul.textContent='Noch keine Releases abgerufen.';}\n"
+"  else rel.forEach(x=>{\n"
+"   const row=document.createElement('div');\n"
+"   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0';\n"
+"   const label=document.createElement('span');\n"
+"   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
+"   label.textContent=x.tag+(x.firmware?'':'   (ohne Firmware-Datei)')+\n"
+"    (x.newer?'   neuer':'');\n"
+"   row.appendChild(label);\n"
+"   if(x.firmware){\n"
+"    const b=document.createElement('button');\n"
+"    b.type='button';b.className=x.newer?'':'secondary';\n"
+"    b.textContent='Installieren';\n"
+"    b.onclick=()=>updInstall(x.tag);\n"
+"    row.appendChild(b);\n"
+"   }\n"
+"   ul.appendChild(row);\n"
+"  });\n"
+"\n"
 "  const av=j.auto_volume||{};\n"
 "  $('autoVolText').textContent=av.enabled\n"
 "   ?('Umfeld '+(av.noise_db??0).toFixed(1)+' dBFS · ruhig bis '+\n"
@@ -5682,6 +5760,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('silLabel').textContent=($('vad_silence_ms').value/1000).toFixed(1)+' s';\n"
 " $('follow_up').checked=j.follow_up!==false;\n"
 " $('clean_markdown').checked=j.clean_markdown!==false;\n"
+" $('update_check').checked=j.update_check!==false;\n"
 " $('auto_volume').checked=j.auto_volume!==false;\n"
 " $('auto_volume_max_db').value=j.auto_volume_max_db??10;\n"
 " $('autoVolLabel').textContent=$('auto_volume_max_db').value+' dB';\n"
@@ -5730,6 +5809,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
 " p.set('clean_markdown',$('clean_markdown').checked?'1':'0');\n"
+" p.set('update_check',$('update_check').checked?'1':'0');\n"
 " p.set('auto_volume',$('auto_volume').checked?'1':'0');\n"
 " p.set('auto_volume_max_db',$('auto_volume_max_db').value);\n"
 " p.set('multi_enabled',$('multi_enabled').checked?'1':'0');\n"
@@ -5890,6 +5970,19 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   box.appendChild(row);\n"
 "  });\n"
 " }catch(e){}\n"
+"}\n"
+"\n"
+"async function updCheck(){\n"
+" toast('Frage GitHub ...');\n"
+" const r=await fetch('/api/update/check',{method:'POST'});\n"
+" toast(await r.text());\n"
+" refreshStatus();\n"
+"}\n"
+"\n"
+"async function updInstall(tag){\n"
+" if(!confirm(tag+' installieren? Das Gerät startet danach neu.'))return;\n"
+" const r=await fetch('/api/update/install?tag='+encodeURIComponent(tag),{method:'POST'});\n"
+" toast(await r.text());\n"
 "}\n"
 "\n"
 "async function radioPlay(name){\n"
@@ -6255,6 +6348,29 @@ void handleStatus() {
   json += "\"period\":\"" + String(scheduleApplied < 0 ? "-" : (scheduleApplied ? "Nacht" : "Tag")) + "\"";
   json += "},";
 
+  json += "\"update\":{";
+  json += "\"installed\":\"" + String(FW_VERSION) + "\",";
+  json += "\"status\":\"" + jsonEscape(updateStatus) + "\",";
+  json += "\"checked\":" + String(updateChecked ? "true" : "false") + ",";
+  json += "\"checking_enabled\":" + String(cfg.updateCheckEnabled ? "true" : "false") + ",";
+  json += "\"in_progress\":" + String(updateInProgress ? "true" : "false") + ",";
+  json += "\"progress\":" + String(updateProgress) + ",";
+  json += "\"age_s\":" + String(updateChecked ? (millis() - updateCheckedAt) / 1000UL : 0UL) + ",";
+  {
+    int newest = updateNewestIndex();
+    json += "\"latest\":\"" + jsonEscape(newest >= 0 ? updateTags[newest] : "") + "\",";
+    json += "\"available\":" +
+            String(newest >= 0 && updateIsNewer(updateTags[newest]) ? "true" : "false") + ",";
+  }
+  json += "\"releases\":[";
+  for (uint8_t i = 0; i < updateReleaseCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"tag\":\"" + jsonEscape(updateTags[i]) + "\",";
+    json += "\"firmware\":" + String(updateUrls[i].length() > 0 ? "true" : "false") + ",";
+    json += "\"newer\":" + String(updateIsNewer(updateTags[i]) ? "true" : "false") + "}";
+  }
+  json += "]},";
+
   json += "\"auto_volume\":{";
   json += "\"enabled\":" + String(cfg.autoVolumeEnabled ? "true" : "false") + ",";
   json += "\"max_db\":" + String(cfg.autoVolumeMaxDb) + ",";
@@ -6374,6 +6490,7 @@ void handleGetConfig() {
   json += "\"timezone\":\"" + jsonEscape(cfg.timezone) + "\",";
   json += "\"ha_publish\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"clean_markdown\":" + String(cfg.cleanMarkdown ? "true" : "false") + ",";
+  json += "\"update_check\":" + String(cfg.updateCheckEnabled ? "true" : "false") + ",";
   json += "\"auto_volume\":" + String(cfg.autoVolumeEnabled ? "true" : "false") + ",";
   json += "\"auto_volume_max_db\":" + String(cfg.autoVolumeMaxDb) + ",";
   json += "\"multi_enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
@@ -6499,6 +6616,11 @@ void handlePostConfig() {
   if (server.hasArg("night_brightness")) {
     cfg.nightBrightness = constrain(server.arg("night_brightness").toInt(), 0, LED_BRIGHTNESS_MAX);
     scheduleTouched = true;
+  }
+
+  if (server.hasArg("update_check")) {
+    cfg.updateCheckEnabled = server.arg("update_check") == "1" ||
+                             server.arg("update_check") == "true";
   }
 
   if (server.hasArg("auto_volume")) {
@@ -7157,6 +7279,346 @@ static bool multiArbitrate() {
 
   diagLogf("MULTI", "%s", multiLastDecision.c_str());
   return won;
+}
+
+// -----------------------------------------------------------------------------
+// Firmware updates from GitHub releases
+//
+// The releases on GitHub are the single source of truth: attach a .bin to a
+// release and it shows up here, in the web interface and in Home Assistant,
+// without a second list to keep in sync.
+//
+// The device caches what it found. The GitHub API allows 60 unauthenticated
+// requests per hour and per address, which a Home Assistant integration polling
+// every ten seconds would burn through in a minute - so everything else reads
+// this cache instead of asking GitHub itself.
+// -----------------------------------------------------------------------------
+
+// "v0.8.1" and "0.8.1" both parse; anything after the third number is ignored.
+static void updateParseVersion(const String &in, int out[3]) {
+  out[0] = out[1] = out[2] = 0;
+
+  String v = in;
+  v.trim();
+  if (v.startsWith("v") || v.startsWith("V")) v.remove(0, 1);
+
+  uint8_t part = 0;
+  String number = "";
+  for (size_t i = 0; i <= v.length() && part < 3; i++) {
+    char c = i < v.length() ? v[i] : '.';
+    if (c >= '0' && c <= '9') {
+      number += c;
+      continue;
+    }
+    if (c == '.' || i == v.length()) {
+      out[part++] = number.toInt();
+      number = "";
+      if (c != '.') break;
+      continue;
+    }
+    break;  // a suffix like -rc1 ends the version
+  }
+}
+
+// Positive when a is newer than b.
+static int updateVersionCompare(const String &a, const String &b) {
+  int va[3];
+  int vb[3];
+  updateParseVersion(a, va);
+  updateParseVersion(b, vb);
+
+  for (uint8_t i = 0; i < 3; i++) {
+    if (va[i] != vb[i]) return va[i] > vb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+static bool updateIsNewer(const String &tag) {
+  return updateVersionCompare(tag, String(FW_VERSION)) > 0;
+}
+
+// The newest release that actually carries a firmware image, or -1.
+static int updateNewestIndex() {
+  int best = -1;
+  for (uint8_t i = 0; i < updateReleaseCount; i++) {
+    if (updateUrls[i].length() == 0) continue;
+    if (best < 0 || updateVersionCompare(updateTags[i], updateTags[best]) > 0) best = i;
+  }
+  return best;
+}
+
+bool updateFetchReleases() {
+  if (WiFi.status() != WL_CONNECTED || apMode) {
+    updateStatus = "kein WLAN";
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String("https://api.github.com/repos/") + UPDATE_REPO +
+               "/releases?per_page=" + String(UPDATE_MAX_RELEASES);
+
+  if (!http.begin(client, url)) {
+    updateStatus = "Verbindung zu GitHub fehlgeschlagen";
+    return false;
+  }
+
+  http.useHTTP10(true);
+  http.setTimeout(12000);
+  http.setReuse(false);
+  // GitHub answers 403 to requests without a User-Agent.
+  http.addHeader("User-Agent", String("VoiceDot/") + FW_VERSION);
+  http.addHeader("Accept", "application/vnd.github+json");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    updateStatus = "GitHub antwortet mit HTTP " + String(code);
+    diagLogf("UPDATE", "release list failed code=%d", code);
+    http.end();
+    return false;
+  }
+
+  // Scanned rather than buffered: release notes run into kilobytes and only two
+  // fields per release are of any interest.
+  static const char *KEY_TAG = "\"tag_name\":\"";
+  static const char *KEY_URL = "\"browser_download_url\":\"";
+
+  Client *stream = http.getStreamPtr();
+  updateReleaseCount = 0;
+
+  uint8_t tagPos = 0;
+  uint8_t urlPos = 0;
+  uint8_t capture = 0;  // 1 = tag, 2 = asset url
+  bool escaped = false;
+  int pending = -1;
+  String value = "";
+  uint32_t deadline = millis() + 20000;
+
+  while ((http.connected() || stream->available() > 0) &&
+         (int32_t)(millis() - deadline) < 0) {
+    int waiting = stream->available();
+    if (waiting <= 0) {
+      ledTick();
+      pumpServices();
+      delay(4);
+      continue;
+    }
+
+    while (waiting-- > 0) {
+      int raw = stream->read();
+      if (raw < 0) break;
+      char c = (char)raw;
+
+      if (capture != 0) {
+        if (escaped) { value += c; escaped = false; continue; }
+        if (c == '\\') { escaped = true; continue; }
+        if (c != '"') {
+          value += c;
+          if (value.length() > 300) { capture = 0; value = ""; }
+          continue;
+        }
+
+        if (capture == 1) {
+          if (updateReleaseCount < UPDATE_MAX_RELEASES) {
+            updateTags[updateReleaseCount] = value;
+            updateUrls[updateReleaseCount] = "";
+            pending = updateReleaseCount;
+            updateReleaseCount++;
+          } else {
+            pending = -1;
+          }
+        } else if (pending >= 0 && value.endsWith(".bin") &&
+                   updateUrls[pending].length() == 0) {
+          updateUrls[pending] = value;
+        }
+
+        capture = 0;
+        value = "";
+        continue;
+      }
+
+      tagPos = (c == KEY_TAG[tagPos]) ? tagPos + 1 : (c == KEY_TAG[0] ? 1 : 0);
+      urlPos = (c == KEY_URL[urlPos]) ? urlPos + 1 : (c == KEY_URL[0] ? 1 : 0);
+
+      if (KEY_TAG[tagPos] == '\0') {
+        capture = 1; tagPos = 0; urlPos = 0; value = "";
+      } else if (KEY_URL[urlPos] == '\0') {
+        capture = 2; tagPos = 0; urlPos = 0; value = "";
+      }
+    }
+
+    ledTick();
+    pumpServices();
+  }
+
+  http.end();
+  updateCheckedAt = millis();
+  updateChecked = true;
+
+  int newest = updateNewestIndex();
+  if (updateReleaseCount == 0) {
+    updateStatus = "keine Releases gefunden";
+  } else if (newest < 0) {
+    updateStatus = String(updateReleaseCount) + " Releases, aber keines mit Firmware";
+  } else if (updateIsNewer(updateTags[newest])) {
+    updateStatus = updateTags[newest] + " steht bereit";
+  } else {
+    updateStatus = "aktuell";
+  }
+
+  diagLogf("UPDATE", "found %u releases, newest with firmware: %s",
+           updateReleaseCount,
+           newest >= 0 ? updateTags[newest].c_str() : "-");
+  return true;
+}
+
+// Runs from the loop, never from a request handler: it takes half a minute and
+// ends in a reboot.
+static void updateInstall(const String &tag) {
+  int index = -1;
+  for (uint8_t i = 0; i < updateReleaseCount; i++) {
+    if (updateTags[i] == tag) { index = i; break; }
+  }
+
+  if (index < 0) {
+    updateStatus = "Version " + tag + " ist nicht bekannt";
+    return;
+  }
+  if (updateUrls[index].length() == 0) {
+    updateStatus = "Release " + tag + " enthaelt keine .bin-Datei";
+    return;
+  }
+
+  // Nothing else may touch the speaker, the network or the flash from here on.
+  radioStop("Firmware-Update");
+  srPauseDetection();
+  setAmplifier(false);
+
+  updateInProgress = true;
+  updateProgress = 0;
+  updateStatus = "laedt " + tag;
+  logPrintf("Update: %s wird geladen", tag.c_str());
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  bool ok = http.begin(client, updateUrls[index]);
+  if (ok) {
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setTimeout(15000);
+    http.setReuse(false);
+    http.addHeader("User-Agent", String("VoiceDot/") + FW_VERSION);
+  }
+
+  int code = ok ? http.GET() : -1;
+  int total = ok ? http.getSize() : -1;
+
+  if (code != HTTP_CODE_OK || total <= 0) {
+    updateStatus = "Download fehlgeschlagen (HTTP " + String(code) + ")";
+    diagLogf("UPDATE", "download failed code=%d size=%d", code, total);
+    http.end();
+    updateInProgress = false;
+    updateProgress = -1;
+    srResumeDetection();
+    return;
+  }
+
+  if (!Update.begin((size_t)total)) {
+    updateStatus = "Kein Platz fuer das Update";
+    diagLogf("UPDATE", "Update.begin failed for %d bytes", total);
+    http.end();
+    updateInProgress = false;
+    updateProgress = -1;
+    srResumeDetection();
+    return;
+  }
+
+  Client *stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  size_t written = 0;
+  bool checkedMagic = false;
+  bool failed = false;
+  uint32_t lastData = millis();
+  int lastLogged = -1;
+
+  while (written < (size_t)total && !failed) {
+    int waiting = stream->available();
+    if (waiting <= 0) {
+      if ((uint32_t)(millis() - lastData) > UPDATE_STALL_TIMEOUT_MS) {
+        updateStatus = "Download abgebrochen (keine Daten mehr)";
+        failed = true;
+        break;
+      }
+      pumpServices();
+      delay(4);
+      continue;
+    }
+
+    int got = stream->read(buf, min<size_t>(sizeof(buf), (size_t)waiting));
+    if (got <= 0) continue;
+    lastData = millis();
+
+    // An ESP32 image starts with 0xE9. Anything else is an error page that
+    // arrived with a 200, and writing it would brick the other partition.
+    if (!checkedMagic) {
+      checkedMagic = true;
+      if (buf[0] != 0xE9) {
+        updateStatus = "Die Datei ist kein ESP32-Firmware-Image";
+        diagLogf("UPDATE", "bad magic 0x%02X", buf[0]);
+        failed = true;
+        break;
+      }
+    }
+
+    if (Update.write(buf, (size_t)got) != (size_t)got) {
+      updateStatus = "Schreibfehler im Flash";
+      failed = true;
+      break;
+    }
+
+    written += (size_t)got;
+    updateProgress = (int)((written * 100ULL) / (size_t)total);
+
+    if (updateProgress / 10 != lastLogged) {
+      lastLogged = updateProgress / 10;
+      logPrintf("Update: %d %% (%lu von %lu Byte)",
+                updateProgress, (unsigned long)written, (unsigned long)total);
+    }
+
+    // A ring that fills up, so the progress is visible without a browser.
+    if (pixels) {
+      uint8_t lit = (uint8_t)((updateProgress * 7) / 100);
+      pixels->clear();
+      for (uint8_t i = 0; i < 7; i++) {
+        if (i <= lit) pixels->setPixelColor(i, pixels->Color(0, 0, 160));
+      }
+      pixels->show();
+    }
+
+    pumpServices();
+  }
+
+  http.end();
+
+  if (failed || !Update.end(true)) {
+    if (!failed) updateStatus = "Update abgeschlossen, aber ungueltig";
+    Update.abort();
+    ledsStatusError();
+    diagLogf("UPDATE", "failed: %s", updateStatus.c_str());
+    updateInProgress = false;
+    updateProgress = -1;
+    srResumeDetection();
+    return;
+  }
+
+  updateStatus = tag + " installiert, Neustart";
+  logPrintf("Update: %s installiert, Neustart", tag.c_str());
+  setAllLeds(0, 160, 0);
+  delay(600);
+  ESP.restart();
 }
 
 // -----------------------------------------------------------------------------
@@ -8177,6 +8639,57 @@ void handleHaTest() {
   }
 }
 
+void handleUpdateCheck() {
+  if (updateInProgress) {
+    server.send(409, "text/plain; charset=utf-8", "Es laeuft bereits ein Update.");
+    return;
+  }
+  if (!updateFetchReleases()) {
+    server.send(502, "text/plain; charset=utf-8", updateStatus);
+    return;
+  }
+  server.send(200, "text/plain; charset=utf-8",
+              String(updateReleaseCount) + " Releases gefunden: " + updateStatus);
+}
+
+void handleUpdateInstall() {
+  if (updateInProgress) {
+    server.send(409, "text/plain; charset=utf-8", "Es laeuft bereits ein Update.");
+    return;
+  }
+
+  String tag = server.arg("tag");
+  if (tag.length() == 0) {
+    int newest = updateNewestIndex();
+    if (newest < 0) {
+      server.send(404, "text/plain; charset=utf-8",
+                  "Kein Release mit Firmware bekannt. Erst nach Updates suchen.");
+      return;
+    }
+    tag = updateTags[newest];
+  }
+
+  int index = -1;
+  for (uint8_t i = 0; i < updateReleaseCount; i++) {
+    if (updateTags[i] == tag) { index = i; break; }
+  }
+  if (index < 0) {
+    server.send(404, "text/plain; charset=utf-8", "Version " + tag + " ist nicht bekannt.");
+    return;
+  }
+  if (updateUrls[index].length() == 0) {
+    server.send(404, "text/plain; charset=utf-8",
+                "Release " + tag + " enthaelt keine .bin-Datei.");
+    return;
+  }
+
+  // Answer first, install from the loop: the browser should not sit on an open
+  // connection while the flash is being written.
+  updateRequestedTag = tag;
+  server.send(200, "text/plain; charset=utf-8",
+              tag + " wird installiert. Das Geraet startet danach neu.");
+}
+
 void handleRadioList() {
   String json = "{\"active\":" + String(radioActive ? "true" : "false");
   json += ",\"station\":\"" + jsonEscape(radioStationName) + "\"";
@@ -8434,6 +8947,8 @@ void setupWebServer() {
   // HTTP_ANY so a plain browser URL works too:
   //   http://<host>/api/announce?text=Hallo
   server.on("/api/announce", HTTP_ANY, handleAnnounce);
+  server.on("/api/update/check", HTTP_ANY, handleUpdateCheck);
+  server.on("/api/update/install", HTTP_ANY, handleUpdateInstall);
   server.on("/api/radio/list", HTTP_GET, handleRadioList);
   server.on("/api/radio/play", HTTP_ANY, handleRadioPlay);
   server.on("/api/radio/stop", HTTP_ANY, handleRadioStop);
@@ -8696,6 +9211,22 @@ void loop() {
     autoVolumeNoiseDb = srRoomNoiseDb;
     autoVolumeNoiseValid = true;
     autoVolumeNoiseAt = millis();
+  }
+
+  // Installing blocks the loop for half a minute and ends in a reboot, so it
+  // runs here and not inside a request handler.
+  if (updateRequestedTag.length() > 0 && !updateInProgress) {
+    String tag = updateRequestedTag;
+    updateRequestedTag = "";
+    updateInstall(tag);
+  }
+
+  if (cfg.updateCheckEnabled && !apMode && WiFi.status() == WL_CONNECTED &&
+      !wakeBusy && !ttsPlaybackActive && !updateInProgress) {
+    bool due = updateChecked
+                 ? (uint32_t)(millis() - updateCheckedAt) > UPDATE_AUTO_CHECK_MS
+                 : millis() > UPDATE_FIRST_CHECK_MS;
+    if (due) updateFetchReleases();
   }
 
   radioTick();

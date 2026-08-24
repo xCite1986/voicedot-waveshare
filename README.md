@@ -51,6 +51,8 @@ Bausteinen.
 - **Lautstärke nach Umgebungslärm**: läuft der Fön, wird die Antwort lauter.
 - **REST-API** für Ansagen und Lautstärke, plus optionale Zustandsmeldung als
   Entität in Home Assistant.
+- **Updates über das Netz**: der VoiceDot holt sich neue Firmware selbst aus
+  den GitHub-Releases, ausgewählt im Webinterface oder in Home Assistant.
 - **Serial-Log im Webinterface** — die letzten 200 Zeilen ohne USB-Kabel.
 - **Webradio** aus einer eigenen Senderliste, gestartet per Sprache
   („Spiele Energy Wien") und beendet mit „Stopp".
@@ -222,6 +224,62 @@ http://voicedot.local/api/announce?text=[dingdong.mp3] Es hat geläutet.
 
 Mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional —
 `[dingdong.mp3]` allein spielt nur den Klang und spart den TTS-Aufruf.
+
+---
+
+## Firmware-Updates über das Netz
+
+Nach der Ersteinrichtung braucht es kein USB-Kabel mehr. Der VoiceDot fragt die
+**Releases dieses Repositories** ab, zeigt sie im Webinterface und in Home
+Assistant an, und lädt die ausgewählte Version selbst herunter.
+
+```text
+POST /api/update/check              Releases von GitHub holen
+POST /api/update/install?tag=v0.8.0 diese Version installieren
+POST /api/update/install            die neueste installieren
+```
+
+Der Zustand steht in `/api/status` unter `update`: installierte Version,
+neueste verfügbare, Fortschritt in Prozent und die Liste der Releases.
+
+### Wie es abläuft
+
+Geschrieben wird immer in die **gerade nicht laufende** der beiden 3-MB-
+App-Partitionen. Bricht der Download ab oder passt etwas nicht, bleibt die
+laufende Version unangetastet — ein misslungenes Update kann das Gerät nicht
+unbrauchbar machen.
+
+Geprüft wird vor dem Schreiben, ob die Datei mit `0xE9` beginnt. Ein
+Fehlerseiten-HTML, das mit Status 200 ankommt, würde sonst in die zweite
+Partition geschrieben.
+
+Der eigentliche Vorgang läuft aus der Hauptschleife, nicht aus dem
+Request-Handler: er dauert eine halbe Minute und endet mit einem Neustart, und
+solange soll kein Browser auf einer offenen Verbindung warten. Der Ring füllt
+sich währenddessen blau, der Fortschritt steht auch im Webinterface.
+
+Einstellungen, Klänge und die Senderliste liegen in einer eigenen Partition und
+überleben das Update. Die **Wake-Word-Modelle ebenfalls** — die werden nicht
+mitgeliefert. Braucht eine künftige Version andere Modelle, reicht ein
+Netz-Update nicht und `srmodels.bin` muss einmal per USB nachgezogen werden.
+
+### Selbst nachsehen
+
+Alle zwölf Stunden fragt das Gerät von sich aus nach, abschaltbar im
+Webinterface. Das Ergebnis wird zwischengespeichert, und alles andere — auch
+die Home-Assistant-Integration — liest diesen Zwischenspeicher statt selbst bei
+GitHub anzufragen: unangemeldet erlaubt die API 60 Anfragen pro Stunde und
+Adresse, was eine alle zehn Sekunden pollende Integration in einer Minute
+aufbrauchen würde.
+
+### Eine Version veröffentlichen
+
+Ein Release ohne angehängte `.bin` erscheint in der Liste, lässt sich aber nicht
+installieren — das Gerät sagt das auch so. Zum Veröffentlichen gehört also:
+
+```bash
+gh release create v0.8.0 build/VoiceDot_Waveshare.ino.bin --title "v0.8.0" --notes "..."
+```
 
 ---
 
@@ -422,6 +480,9 @@ Umstellung keine doppelte oder fehlende Stunde.
   während der Musik gehört werden kann.
 - HTTPS zu Home Assistant läuft mit `setInsecure()`, das Zertifikat wird nicht
   geprüft.
+- Firmware-Updates brauchen eine TLS-Verbindung zu GitHub, und die ist auf
+  diesem Chip knapp: gemessen bleiben während des Handshakes noch rund 6 kB
+  interner Heap übrig. Es funktioniert, aber viel Luft ist da nicht.
 - **Die API ist unauthentifiziert** — inklusive OTA. VoiceDot gehört in ein
   vertrauenswürdiges Netz.
 
