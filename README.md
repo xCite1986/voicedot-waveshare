@@ -5,6 +5,7 @@ Firmware für einen Home-Assistant-Sprachassistenten auf dem
 Assist-Pipeline und Sprachausgabe direkt auf dem Gerät.
 
 https://www.waveshare.com/esp32-s3-audio-board.htm
+
 https://www.berrybase.at/waveshare-esp32-s3-ai-smart-speaker-development-board-dual-mikrofon-wifi-bt5-16mb-flash-240-mhz
 
 Der Ordner `VoiceDot_Waveshare/` enthält immer den **aktuellen, lauffähigen
