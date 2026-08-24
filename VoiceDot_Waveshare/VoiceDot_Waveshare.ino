@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.8.0";
+static const char* FW_VERSION = "0.8.1";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -461,7 +461,7 @@ uint32_t updateCheckedAt = 0;
 bool updateChecked = false;
 bool updateInProgress = false;
 int updateProgress = -1;
-String updateRequestedTag = "";
+uint32_t updateRebootAt = 0;
 
 // The room noise the boost is based on. Kept apart from srRoomNoiseDb because
 // that one keeps tracking while the radio plays, and a loudspeaker measuring
@@ -739,7 +739,10 @@ bool updateFetchReleases();
 static int updateNewestIndex();
 static bool updateIsNewer(const String &tag);
 static int updateVersionCompare(const String &a, const String &b);
-static void updateInstall(const String &tag);
+static void updateDownloadAndWrite(const String &tag, const String &url);
+static bool updateHasPending();
+static void updateRunPending();
+static void updateLoadResult();
 static void radioLoadStations();
 void radioStop(const char *why);
 bool radioStart(const String &name, const String &url);
@@ -7474,23 +7477,38 @@ bool updateFetchReleases() {
   return true;
 }
 
-// Runs from the loop, never from a request handler: it takes half a minute and
-// ends in a reboot.
-static void updateInstall(const String &tag) {
-  int index = -1;
-  for (uint8_t i = 0; i < updateReleaseCount; i++) {
-    if (updateTags[i] == tag) { index = i; break; }
-  }
+// Remembers what to install across the reboot. The release list does not
+// survive it, so the URL travels along and no second GitHub call is needed.
+static void updateStorePending(const String &tag, const String &url) {
+  prefs.begin("voicedot", false);
+  prefs.putString("upd_tag", tag);
+  prefs.putString("upd_url", url);
+  prefs.end();
+}
 
-  if (index < 0) {
-    updateStatus = "Version " + tag + " ist nicht bekannt";
-    return;
-  }
-  if (updateUrls[index].length() == 0) {
-    updateStatus = "Release " + tag + " enthaelt keine .bin-Datei";
-    return;
-  }
+static bool updateHasPending() {
+  prefs.begin("voicedot", true);
+  bool pending = prefs.getString("upd_tag", "").length() > 0;
+  prefs.end();
+  return pending;
+}
 
+// What the last attempt did, so the reason for a failure survives the reboot
+// and can be shown in the interface.
+static void updateStoreResult(const String &message) {
+  prefs.begin("voicedot", false);
+  prefs.putString("upd_msg", message);
+  prefs.end();
+}
+
+static void updateLoadResult() {
+  prefs.begin("voicedot", true);
+  String message = prefs.getString("upd_msg", "");
+  prefs.end();
+  if (message.length() > 0) updateStatus = message;
+}
+
+static void updateDownloadAndWrite(const String &tag, const String &url) {
   // Nothing else may touch the speaker, the network or the flash from here on.
   radioStop("Firmware-Update");
   srPauseDetection();
@@ -7505,7 +7523,7 @@ static void updateInstall(const String &tag) {
   client.setInsecure();
 
   HTTPClient http;
-  bool ok = http.begin(client, updateUrls[index]);
+  bool ok = http.begin(client, url);
   if (ok) {
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setTimeout(15000);
@@ -7520,6 +7538,7 @@ static void updateInstall(const String &tag) {
     updateStatus = "Download fehlgeschlagen (HTTP " + String(code) + ")";
     diagLogf("UPDATE", "download failed code=%d size=%d", code, total);
     http.end();
+    updateStoreResult(updateStatus);
     updateInProgress = false;
     updateProgress = -1;
     srResumeDetection();
@@ -7530,6 +7549,7 @@ static void updateInstall(const String &tag) {
     updateStatus = "Kein Platz fuer das Update";
     diagLogf("UPDATE", "Update.begin failed for %d bytes", total);
     http.end();
+    updateStoreResult(updateStatus);
     updateInProgress = false;
     updateProgress = -1;
     srResumeDetection();
@@ -7608,17 +7628,37 @@ static void updateInstall(const String &tag) {
     Update.abort();
     ledsStatusError();
     diagLogf("UPDATE", "failed: %s", updateStatus.c_str());
+    updateStoreResult(updateStatus);
     updateInProgress = false;
     updateProgress = -1;
     srResumeDetection();
     return;
   }
 
+  updateStoreResult(tag + " installiert");
   updateStatus = tag + " installiert, Neustart";
   logPrintf("Update: %s installiert, Neustart", tag.c_str());
   setAllLeds(0, 160, 0);
   delay(600);
   ESP.restart();
+}
+
+// Runs during boot, before the detector claims its share of the heap. The
+// request is cleared before the attempt: a version that cannot be downloaded
+// must not turn into a reboot loop.
+static void updateRunPending() {
+  prefs.begin("voicedot", false);
+  String tag = prefs.getString("upd_tag", "");
+  String url = prefs.getString("upd_url", "");
+  prefs.remove("upd_tag");
+  prefs.remove("upd_url");
+  prefs.end();
+
+  if (tag.length() == 0 || url.length() == 0) return;
+
+  logPrintf("Update: installiere %s (Heap frei: %lu)",
+            tag.c_str(), (unsigned long)ESP.getFreeHeap());
+  updateDownloadAndWrite(tag, url);  // reboots when it worked
 }
 
 // -----------------------------------------------------------------------------
@@ -8683,11 +8723,15 @@ void handleUpdateInstall() {
     return;
   }
 
-  // Answer first, install from the loop: the browser should not sit on an open
-  // connection while the flash is being written.
-  updateRequestedTag = tag;
+  // Answer first, then reboot into the install. Doing it here would run the TLS
+  // handshake against a heap the detector has already spoken for - measured, it
+  // left 380 bytes and failed.
+  updateStorePending(tag, updateUrls[index]);
+  updateRebootAt = millis() + 400;
+  updateStatus = "Neustart zum Installieren von " + tag;
   server.send(200, "text/plain; charset=utf-8",
-              tag + " wird installiert. Das Geraet startet danach neu.");
+              tag + " wird installiert. Das Geraet startet dafuer jetzt neu und "
+              "meldet sich in etwa einer Minute zurueck.");
 }
 
 void handleRadioList() {
@@ -9044,8 +9088,17 @@ void setup() {
     logPrintf("LittleFS: mount failed, Ansagen nicht verfuegbar");
   }
 
-  Serial.println("BOOT: wake word");
-  srBegin();
+  updateLoadResult();
+
+  // On an update boot the detector stays off: its DSP buffers are the biggest
+  // block of internal RAM in the way of the TLS connection to GitHub.
+  bool pendingUpdate = updateHasPending();
+  if (!pendingUpdate) {
+    Serial.println("BOOT: wake word");
+    srBegin();
+  } else {
+    Serial.println("BOOT: wake word uebersprungen, Update steht an");
+  }
 
   Serial.println("BOOT: wifi");
   bool wifiOk = connectToWiFi();
@@ -9087,6 +9140,14 @@ void setup() {
   }
 
   applySchedule(true);
+
+  if (pendingUpdate) {
+    if (wifiOk) updateRunPending();  // reboots when it worked
+
+    // Only reached when the update did not happen.
+    Serial.println("BOOT: wake word (nach Update-Versuch)");
+    srBegin();
+  }
 
   radioLoadStations();
   logPrintf("Radio: %u Sender gespeichert", radioStationCount);
@@ -9213,12 +9274,11 @@ void loop() {
     autoVolumeNoiseAt = millis();
   }
 
-  // Installing blocks the loop for half a minute and ends in a reboot, so it
-  // runs here and not inside a request handler.
-  if (updateRequestedTag.length() > 0 && !updateInProgress) {
-    String tag = updateRequestedTag;
-    updateRequestedTag = "";
-    updateInstall(tag);
+  // The install itself happens on the next boot, where the whole heap is still
+  // free. Here we only get out of the way.
+  if (updateRebootAt != 0 && (int32_t)(millis() - updateRebootAt) >= 0) {
+    logPrintf("Update: Neustart zum Installieren");
+    ESP.restart();
   }
 
   if (cfg.updateCheckEnabled && !apMode && WiFi.status() == WL_CONNECTED &&
