@@ -359,10 +359,32 @@ Rauschboden-Anzeige, samt Live-Anzeige der aktuellen Anhebung.
 
 Beides wertet das Gerät **selbst** aus, so wie „Lautstärke 5": die Senderliste
 liegt lokal, ein Sprachmodell könnte den Namen ohnehin nur nachschlagen.
+
+**„Spiele …" bleibt immer beim Radio.** Ist der Name nicht in der Liste, fragt
+das Gerät zurück, statt die Bitte an Home Assistant durchzureichen — der
+Assistent kann kein Radio abspielen und würde nur eine Entschuldigung
+zurückgeben:
+
+```text
+„Spiele Radio Paloma"
+   → „Den Sender kenne ich nicht. Ich habe Energy Wien, TechnoBase.FM
+      oder ORF Hitradio Ö3. Welchen soll ich spielen?"
+„Energy Wien"
+   → spielt
+```
+
+Die Antwort darf der blanke Name sein, ohne „spiele" davor. „Abbrechen",
+„nichts" oder „egal" beenden die Nachfrage; ein zweiter unbekannter Name auch,
+damit es nicht im Kreis läuft. Gehört wird die Antwort 30 Sekunden lang, und
+nur wenn **Rückfragen fortsetzen** eingeschaltet ist — sonst wird die Liste nur
+vorgelesen.
+
+Auch „Spiele" allein, ohne Namen, führt zur Nachfrage.
 Gesprochener Name und gespeicherter Name werden vorher auf gemeinsamen Nenner
 gebracht — klein geschrieben, Umlaute ausgeschrieben, Satzzeichen weg —, und
 wenn nichts exakt passt, gewinnt der Sender mit den meisten übereinstimmenden
-Wörtern.
+Wörtern. Ein einzelnes gemeinsames Wort in einer mehrwortigen Anfrage reicht
+dafür nicht — das wäre geraten, und geraten wird lieber nachgefragt.
 
 Sender pflegst du im Webinterface unter **WEBRADIO**. Das Suchfeld fragt
 **radio-browser.info** ab, und zwar aus deinem Browser heraus, nicht vom Gerät:
