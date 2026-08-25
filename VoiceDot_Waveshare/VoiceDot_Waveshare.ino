@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.8.7";
+static const char* FW_VERSION = "0.9.0";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -233,6 +233,9 @@ static const char *RADIO_STATION_FILE = "/radio.txt";
 // A TLS session costs about 43 kB of internal RAM on this chip. Measured with
 // an https:// stream running, the web interface still answered - after 25
 // seconds. Below this much free heap the stream is refused instead.
+// How long an answer to "which station?" still counts as an answer.
+static constexpr uint32_t RADIO_ANSWER_WINDOW_MS = 30000;
+
 static constexpr uint32_t RADIO_TLS_MIN_HEAP = 20000;
 
 // What one costs, measured: 52 kB free before, 8.8 kB after. Attempting a
@@ -498,6 +501,11 @@ uint16_t radioSampleRate = 0;
 uint8_t radioChannels = 0;
 uint8_t radioReconnects = 0;
 bool radioUsingTls = false;
+
+// A "spiele ..." we could not resolve turns into a question of our own.
+bool radioAskPending = false;
+String radioAskText = "";
+uint32_t radioAnswerUntil = 0;
 
 HTTPClient *radioHttp = nullptr;
 WiFiClient *radioPlain = nullptr;
@@ -4529,6 +4537,23 @@ void runWakeCaptureAndHa() {
                   !apMode && WiFi.status() == WL_CONNECTED;
   haContinueConversation = false;
 
+  // A local command can have a question of its own - "which station?" - and
+  // then wants the next utterance, exactly like a follow-up from Home
+  // Assistant. Whether we actually listen respects the same setting.
+  if (radioAskPending) {
+    radioAskPending = false;
+    wakeAssistantText = radioAskText;
+    setLedPhase(LED_PHASE_SPEAK);
+    playAnnouncement(radioAskText);
+
+    if (radioAnswerUntil != 0 && cfg.followUp && !apMode &&
+        WiFi.status() == WL_CONNECTED) {
+      followUp = true;
+    } else {
+      radioAnswerUntil = 0;
+    }
+  }
+
   if (wakeLastState == "error") {
     setLedPhase(LED_PHASE_ERROR);
   } else if (!followUp) {
@@ -7914,7 +7939,15 @@ static int radioFindStation(const String &spokenNorm) {
     }
   }
 
-  return bestScore >= 100 ? best : -1;
+  // One matching word out of several is a guess, not a match: "spiele Radio
+  // Wien" should ask rather than start Energy Wien because both say "Wien".
+  uint8_t spokenWords = 1;
+  for (size_t i = 0; i < spokenNorm.length(); i++) {
+    if (spokenNorm[i] == ' ') spokenWords++;
+  }
+  int needed = spokenWords >= 2 ? 200 : 100;
+
+  return bestScore >= needed ? best : -1;
 }
 
 static void radioBeginOutput() {
@@ -8384,6 +8417,47 @@ void radioTick() {
   }
 }
 
+// The stored names as something speakable: "A, B oder C".
+static String radioStationSentence() {
+  String out;
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    if (i > 0) out += (i + 1 == radioStationCount) ? " oder " : ", ";
+    out += radioStationNames[i];
+  }
+  return out;
+}
+
+// "Spiele ..." always means a station from the local list, so a name we do not
+// know is a question to ask back. Handing it to the assistant would only
+// produce an apology - it cannot play radio either.
+static void radioAskWhichStation(const String &heard) {
+  if (radioStationCount == 0) {
+    radioAskText = "Es sind noch keine Radiosender gespeichert. "
+                   "Im Webinterface kannst du welche hinzufuegen.";
+    radioAnswerUntil = 0;
+  } else {
+    radioAskText = "Den Sender kenne ich nicht. Ich habe " +
+                   radioStationSentence() + ". Welchen soll ich spielen?";
+    radioAnswerUntil = millis() + RADIO_ANSWER_WINDOW_MS;
+  }
+
+  radioAskPending = true;
+  wakeLastMessage = "Nachfrage: welcher Sender?";
+  diagLogf("RADIO", "unknown station \"%s\", asking back", heard.c_str());
+}
+
+static bool radioStartByIndex(int index) {
+  if (index < 0 || index >= (int)radioStationCount) return false;
+
+  if (!radioStart(radioStationNames[index], radioStationUrls[index])) {
+    wakeLastMessage = "Radio konnte nicht starten: " + radioStatus;
+    return true;
+  }
+
+  wakeLastMessage = "Radio " + radioStationNames[index] + " gestartet.";
+  return true;
+}
+
 // "Spiele Energy Wien" and "Stopp" are ours: the station list lives on this
 // device, so resolving the name here saves a round trip through the assistant.
 static bool radioHandleVoiceCommand(const String &lower) {
@@ -8394,6 +8468,29 @@ static bool radioHandleVoiceCommand(const String &lower) {
   if (words > 8) return false;
 
   String norm = radioNormalize(lower);
+
+  // Answering the question we just asked: the whole utterance is the station
+  // name, without a "spiele" in front of it.
+  if (radioAnswerUntil != 0 && (int32_t)(millis() - radioAnswerUntil) < 0) {
+    radioAnswerUntil = 0;
+
+    if (norm.length() == 0 || norm == "keinen" || norm == "keiner" ||
+        norm == "nichts" || norm == "abbrechen" || norm == "egal" ||
+        norm == "danke" || norm == "vergiss es" || norm == "lass es") {
+      wakeLastMessage = "Radiowahl abgebrochen.";
+      return true;
+    }
+
+    int chosen = radioFindStation(norm);
+    if (chosen >= 0) return radioStartByIndex(chosen);
+
+    // Asking again would only go in circles.
+    radioAskText = "Den kenne ich auch nicht.";
+    radioAnswerUntil = 0;
+    radioAskPending = true;
+    wakeLastMessage = "Sender weiterhin unbekannt.";
+    return true;
+  }
 
   if (radioActive) {
     if (norm == "stopp" || norm == "stop" || norm == "aus" || norm == "halt" ||
@@ -8407,37 +8504,36 @@ static bool radioHandleVoiceCommand(const String &lower) {
     }
   }
 
+  // "Spiele" on its own is already a radio command - just without a name yet.
+  if (norm == "spiele" || norm == "spiel" || norm == "radio" ||
+      norm == "spiele radio" || norm == "starte radio" || norm == "musik") {
+    radioAskWhichStation("");
+    return true;
+  }
+
   const char *prefixes[] = {"spiele radio ", "spiel radio ", "starte radio ",
                             "spiele ", "spiel ", "spielen sie ", "radio "};
   String wanted = "";
+  bool isPlayCommand = false;
   for (uint8_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
     String prefix = prefixes[i];
     if (norm.startsWith(prefix)) {
       wanted = norm.substring(prefix.length());
+      isPlayCommand = true;
       break;
     }
   }
-  if (wanted.length() == 0) return false;
+  if (!isPlayCommand) return false;
 
   wanted.trim();
-  if (wanted.length() < 2) return false;
 
-  int index = radioFindStation(wanted);
+  int index = wanted.length() >= 2 ? radioFindStation(wanted) : -1;
   if (index < 0) {
-    // Say so instead of silently handing an unknown station to the assistant,
-    // which would only answer that it cannot play music either.
-    wakeLastMessage = "Sender \"" + wanted + "\" steht nicht in der Liste.";
-    diagLogf("RADIO", "no station matches \"%s\"", wanted.c_str());
-    return false;
-  }
-
-  if (!radioStart(radioStationNames[index], radioStationUrls[index])) {
-    wakeLastMessage = "Radio konnte nicht starten: " + radioStatus;
+    radioAskWhichStation(wanted);
     return true;
   }
 
-  wakeLastMessage = "Radio " + radioStationNames[index] + " gestartet.";
-  return true;
+  return radioStartByIndex(index);
 }
 
 // -----------------------------------------------------------------------------
