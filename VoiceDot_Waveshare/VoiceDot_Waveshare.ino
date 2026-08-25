@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.9.1";
+static const char* FW_VERSION = "0.9.2";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -7909,6 +7909,31 @@ static bool radioSaveStations() {
   return true;
 }
 
+// Two words count as the same when one contains the other or they share their
+// first four letters. Speech recognition writing a German sentence turns
+// "Energy" into "Energie", and that must not cost the match.
+static bool radioWordsMatch(const String &a, const String &b) {
+  if (a == b) return true;
+  if (a.length() >= 3 && b.indexOf(a) >= 0) return true;
+  if (b.length() >= 3 && a.indexOf(b) >= 0) return true;
+  if (a.length() >= 4 && b.length() >= 4 && a.substring(0, 4) == b.substring(0, 4)) {
+    return true;
+  }
+  return false;
+}
+
+// Does any word of `spoken` match `word`?
+static bool radioAnyWordMatches(const String &spoken, const String &word) {
+  String rest = spoken;
+  while (rest.length() > 0) {
+    int space = rest.indexOf(' ');
+    String candidate = space < 0 ? rest : rest.substring(0, space);
+    rest = space < 0 ? "" : rest.substring(space + 1);
+    if (radioWordsMatch(word, candidate)) return true;
+  }
+  return false;
+}
+
 // Which station the user meant. An exact hit wins, a contained name is next,
 // and beyond that the station sharing the most words with what was said - so
 // "spiele energy" still finds "ENERGY Wien" when it is the only Energy around.
@@ -7930,13 +7955,25 @@ static int radioFindStation(const String &spokenNorm) {
     } else if (name.indexOf(spokenNorm) >= 0) {
       score = 4000 + (int)spokenNorm.length();
     } else {
+      // Counted as a fraction of the station's own words rather than as an
+      // absolute number: half of "Energy Wien" is a match, half of a name with
+      // six words is not.
+      uint8_t nameWords = 0;
+      uint8_t matched = 0;
+
       String rest = name;
       while (rest.length() > 0) {
         int space = rest.indexOf(' ');
         String word = space < 0 ? rest : rest.substring(0, space);
         rest = space < 0 ? "" : rest.substring(space + 1);
         if (word.length() < 3) continue;
-        if (spokenNorm.indexOf(word) >= 0) score += 100;
+
+        nameWords++;
+        if (radioAnyWordMatches(spokenNorm, word)) matched++;
+      }
+
+      if (nameWords > 0 && matched > 0 && matched * 2 >= nameWords) {
+        score = 100 * matched;
       }
     }
 
@@ -7946,15 +7983,7 @@ static int radioFindStation(const String &spokenNorm) {
     }
   }
 
-  // One matching word out of several is a guess, not a match: "spiele Radio
-  // Wien" should ask rather than start Energy Wien because both say "Wien".
-  uint8_t spokenWords = 1;
-  for (size_t i = 0; i < spokenNorm.length(); i++) {
-    if (spokenNorm[i] == ' ') spokenWords++;
-  }
-  int needed = spokenWords >= 2 ? 200 : 100;
-
-  return bestScore >= needed ? best : -1;
+  return bestScore >= 100 ? best : -1;
 }
 
 static void radioBeginOutput() {
