@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.8.4";
+static const char* FW_VERSION = "0.8.7";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -719,6 +719,7 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  uint8_t volumeStep;      // what "leiser" and "lauter" move by
   bool updateCheckEnabled; // ask GitHub for newer releases on its own
   bool autoVolumeEnabled;  // lift the voice when the room gets loud
   uint8_t autoVolumeMaxDb; // how far it may lift it
@@ -991,6 +992,31 @@ static int spokenVolumeStep(const String &lower) {
   return -1;
 }
 
+// "Leiser" and "lauter" without a number, moving by a step the user picks.
+// Deliberately only for very short utterances: "mach mal die Musik leiser im
+// Wohnzimmer" belongs to the assistant, not to this speaker.
+static bool volumeStepVoiceCommand(const String &lower) {
+  uint8_t words = 1;
+  for (size_t i = 0; i < lower.length(); i++) {
+    if (lower[i] == ' ') words++;
+  }
+  if (words > 4 || lower.length() > 30) return false;
+
+  bool down = lower.indexOf("leiser") >= 0;
+  bool up = lower.indexOf("lauter") >= 0;
+  if (down == up) return false;  // neither, or a sentence with both
+
+  int target = (int)cfg.volume + (up ? (int)cfg.volumeStep : -(int)cfg.volumeStep);
+  target = constrain(target, 0, 100);
+
+  setVolume((uint8_t)target);
+  wakeLastMessage = String(up ? "Lauter" : "Leiser") + ": Lautstaerke " +
+                    String(target) + " %";
+  diagLogf("LOCAL_CMD", "volume %s by %u to %d%% from \"%s\"",
+           up ? "up" : "down", cfg.volumeStep, target, lower.c_str());
+  return true;
+}
+
 // Some commands are ours, not Home Assistant's: the volume of this speaker is
 // a local property, and routing it through an LLM would be slow and unreliable.
 // Returns true when the transcript was consumed here.
@@ -1006,6 +1032,7 @@ static bool handleLocalVoiceCommand(const String &text) {
   // a name here saves a round trip through a language model that cannot play
   // music anyway.
   if (radioHandleVoiceCommand(lower)) return true;
+  if (volumeStepVoiceCommand(lower)) return true;
 
   // The command has to *be* the sentence, not appear somewhere inside it.
   // Otherwise "stell die Lautstärke im Wohnzimmer auf 5" would turn this
@@ -1253,6 +1280,7 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.volumeStep = constrain(prefs.getUChar("vol_step", 10), 5, 25);
   cfg.updateCheckEnabled = prefs.getBool("upd_chk", true);
   cfg.autoVolumeEnabled = prefs.getBool("avol_on", true);
   cfg.autoVolumeMaxDb = constrain(prefs.getUChar("avol_max", 10), 0, 18);
@@ -1304,6 +1332,7 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putUChar("vol_step", cfg.volumeStep);
   prefs.putBool("upd_chk", cfg.updateCheckEnabled);
   prefs.putBool("avol_on", cfg.autoVolumeEnabled);
   prefs.putUChar("avol_max", cfg.autoVolumeMaxDb);
@@ -1523,9 +1552,15 @@ bool codecUpdate(uint8_t address, uint8_t reg, uint8_t mask, uint8_t value) {
   return codecWrite(address, reg, (oldValue & ~mask) | (value & mask));
 }
 
+// The amplifier gets uncomfortably loud well before the codec's register runs
+// out, so the top of the scale is capped: what the interface calls 100 % is
+// four fifths of what the chip could do, and nothing goes above it - the
+// ambient boost included.
+static constexpr uint8_t ES8311_REG_CEILING = 209;  // 80 % of the full 32..255
+
 uint8_t es8311VolumeReg(uint8_t percent) {
   if (percent == 0) return 0x00;
-  return map(percent, 1, 100, 32, 255);
+  return map(percent, 1, 100, 32, ES8311_REG_CEILING);
 }
 
 // A boost in decibels is just an offset on the volume register - going through
@@ -1536,7 +1571,7 @@ void es8311SetVolumeBoosted(uint8_t percent, float boostDb) {
   int reg = es8311VolumeReg(percent);
   if (percent > 0 && boostDb > 0.0f) {
     reg += (int)lroundf(boostDb / ES8311_DB_PER_STEP);
-    if (reg > 255) reg = 255;
+    if (reg > ES8311_REG_CEILING) reg = ES8311_REG_CEILING;
   }
 
   codecWrite(ADDR_ES8311, 0x32, (uint8_t)reg);
@@ -4718,6 +4753,34 @@ void ledsStatusIdle() {
   else ledsStatusReady();
 }
 
+// Why the device last restarted. Without this a crash and a deliberate reboot
+// look exactly alike from the outside, and guessing which one happened has
+// already cost enough time.
+static String resetReasonName() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  switch (reason) {
+    case ESP_RST_POWERON:   return "Einschalten";
+    case ESP_RST_EXT:       return "externer Reset";
+    case ESP_RST_SW:        return "Neustart per Software";
+    case ESP_RST_PANIC:     return "Absturz";
+    case ESP_RST_INT_WDT:   return "Interrupt-Watchdog";
+    case ESP_RST_TASK_WDT:  return "Task-Watchdog";
+    case ESP_RST_WDT:       return "Watchdog";
+    case ESP_RST_DEEPSLEEP: return "Deep Sleep";
+    case ESP_RST_BROWNOUT:  return "Unterspannung";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:
+      switch ((int)reason) {
+        case 11: return "USB-Reset";
+        case 12: return "JTAG-Reset";
+        case 13: return "eFuse-Fehler";
+        case 14: return "Spannungseinbruch";
+        case 15: return "CPU-Blockade";
+        default: return "sonstiger Grund (" + String((int)reason) + ")";
+      }
+  }
+}
+
 // Name of the current ring animation, for the status page and for checking
 // from outside that a self-terminating phase really did terminate.
 static const char *ledPhaseName() {
@@ -5212,6 +5275,15 @@ button.orange{background:#45351e;color:#ffd69a;border:1px solid #71562c}
 <input id="volume" type="range" min="0" max="100" value="60"
  oninput="volLabel.textContent=this.value+' %'" onchange="applyRuntime()">
 <small id="volLabel" class="help">60 %</small>
+<small class="help">
+100 % entspricht 80 % dessen, was der Codec könnte — darüber wird abgeriegelt,
+auch für die Anhebung nach Umgebungslärm.
+</small>
+
+<label>Schrittweite für „leiser" und „lauter"</label>
+<input id="volume_step" type="range" min="5" max="25" step="5" value="10"
+ oninput="volStepLabel.textContent=this.value+' %'">
+<small id="volStepLabel" class="help">10 %</small>
 
 <label>Sprechtempo</label>
 <input id="tts_speed" type="range" min="75" max="135" step="5" value="100"
@@ -5774,6 +5846,8 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('silLabel').textContent=($('vad_silence_ms').value/1000).toFixed(1)+' s';\n"
 " $('follow_up').checked=j.follow_up!==false;\n"
 " $('clean_markdown').checked=j.clean_markdown!==false;\n"
+" $('volume_step').value=j.volume_step??10;\n"
+" $('volStepLabel').textContent=$('volume_step').value+' %';\n"
 " $('update_check').checked=j.update_check!==false;\n"
 " $('auto_volume').checked=j.auto_volume!==false;\n"
 " $('auto_volume_max_db').value=j.auto_volume_max_db??10;\n"
@@ -5823,6 +5897,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
 " p.set('clean_markdown',$('clean_markdown').checked?'1':'0');\n"
+" p.set('volume_step',$('volume_step').value);\n"
 " p.set('update_check',$('update_check').checked?'1':'0');\n"
 " p.set('auto_volume',$('auto_volume').checked?'1':'0');\n"
 " p.set('auto_volume_max_db',$('auto_volume_max_db').value);\n"
@@ -6265,7 +6340,8 @@ void handleStatus() {
   json += "\"tca9555\":" + String(tca9555Present ? "true" : "false") + ",";
   json += "\"rtc\":" + String(rtcPresent ? "true" : "false") + ",";
   json += "\"amp_enabled\":" + String(amplifierEnabled ? "true" : "false") + ",";
-  json += "\"led_phase\":\"" + String(ledPhaseName()) + "\"";
+  json += "\"led_phase\":\"" + String(ledPhaseName()) + "\",";
+  json += "\"reset_reason\":\"" + jsonEscape(resetReasonName()) + "\"";
   json += "},";
 
   json += "\"audio\":{";
@@ -6510,6 +6586,7 @@ void handleGetConfig() {
   json += "\"timezone\":\"" + jsonEscape(cfg.timezone) + "\",";
   json += "\"ha_publish\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"clean_markdown\":" + String(cfg.cleanMarkdown ? "true" : "false") + ",";
+  json += "\"volume_step\":" + String(cfg.volumeStep) + ",";
   json += "\"update_check\":" + String(cfg.updateCheckEnabled ? "true" : "false") + ",";
   json += "\"auto_volume\":" + String(cfg.autoVolumeEnabled ? "true" : "false") + ",";
   json += "\"auto_volume_max_db\":" + String(cfg.autoVolumeMaxDb) + ",";
@@ -6636,6 +6713,10 @@ void handlePostConfig() {
   if (server.hasArg("night_brightness")) {
     cfg.nightBrightness = constrain(server.arg("night_brightness").toInt(), 0, LED_BRIGHTNESS_MAX);
     scheduleTouched = true;
+  }
+
+  if (server.hasArg("volume_step")) {
+    cfg.volumeStep = constrain(server.arg("volume_step").toInt(), 5, 25);
   }
 
   if (server.hasArg("update_check")) {
@@ -8948,6 +9029,28 @@ void handleRadioDelete() {
   server.send(200, "text/plain; charset=utf-8", name + " geloescht.");
 }
 
+void handleAdcScan() {
+  String json = "{";
+
+  uint8_t p0 = 0;
+  uint8_t p1 = 0;
+  bool expanderOk = tca9555Present &&
+                    codecRead(ADDR_TCA9555, 0x00, p0) &&
+                    codecRead(ADDR_TCA9555, 0x01, p1);
+  json += "\"expander\":{\"present\":" + String(tca9555Present ? "true" : "false");
+  json += ",\"read_ok\":" + String(expanderOk ? "true" : "false");
+  json += ",\"port0\":" + String(p0) + ",\"port1\":" + String(p1) + "},";
+
+  json += "\"channels\":[";
+  for (uint8_t pin = 1; pin <= 9; pin++) {
+    if (pin > 1) json += ",";
+    uint32_t mv = analogReadMilliVolts(pin);
+    json += "{\"gpio\":" + String(pin) + ",\"mv\":" + String(mv) + "}";
+  }
+  json += "]}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
 void handleLedTest() {
   if (!pixels) {
     server.send(500, "text/plain; charset=utf-8", "LED-Treiber nicht initialisiert.");
@@ -9090,6 +9193,7 @@ void setupWebServer() {
   // HTTP_ANY so a plain browser URL works too:
   //   http://<host>/api/announce?text=Hallo
   server.on("/api/announce", HTTP_ANY, handleAnnounce);
+  server.on("/api/hardware/adc-scan", HTTP_GET, handleAdcScan);
   server.on("/api/update/check", HTTP_ANY, handleUpdateCheck);
   server.on("/api/update/install", HTTP_ANY, handleUpdateInstall);
   server.on("/api/radio/list", HTTP_GET, handleRadioList);
@@ -9154,6 +9258,8 @@ void setup() {
   Serial.printf("PSRAM size : %lu\n", (unsigned long)ESP.getPsramSize());
   Serial.printf("Free heap  : %lu\n", (unsigned long)ESP.getFreeHeap());
 
+  Serial.printf("BOOT: last reset was %s\n", resetReasonName().c_str());
+
   Serial.println("BOOT: load config");
   loadConfig();
 
@@ -9187,6 +9293,7 @@ void setup() {
     logPrintf("LittleFS: mount failed, Ansagen nicht verfuegbar");
   }
 
+  logPrintf("Neustart-Grund: %s", resetReasonName().c_str());
   updateLoadResult();
 
   // On an update boot the detector stays off: its DSP buffers are the biggest

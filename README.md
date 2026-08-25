@@ -47,7 +47,8 @@ Bausteinen.
 - **Markdown-Bereinigung**: Antworten von Sprachmodellen werden vor der Ausgabe
   von `**`, Aufzählungszeichen und Co. befreit.
 - **Tag/Nacht-Profil** für Lautstärke und LED-Helligkeit, per NTP und RTC.
-- **Lautstärke per Sprache**: „Lautstärke 5" wird lokal ausgewertet.
+- **Lautstärke per Sprache**: „Lautstärke 5", „leiser" und „lauter" werden
+  lokal ausgewertet.
 - **Lautstärke nach Umgebungslärm**: läuft der Fön, wird die Antwort lauter.
 - **REST-API** für Ansagen und Lautstärke, plus optionale Zustandsmeldung als
   Entität in Home Assistant.
@@ -239,6 +240,11 @@ POST /api/update/install?tag=v0.8.0 diese Version installieren
 POST /api/update/install            die neueste installieren
 ```
 
+In `/api/status` steht unter `hardware.reset_reason`, **warum** das Gerät
+zuletzt gestartet ist — Einschalten, Neustart per Software, Absturz, Watchdog,
+Unterspannung oder USB-Reset. Ohne das sieht ein Absturz von außen genauso aus
+wie ein gewollter Neustart, und das Raten danach hat schon genug Zeit gekostet.
+
 Der Zustand steht in `/api/status` unter `update`: installierte Version,
 neueste verfügbare, Fortschritt in Prozent und die Liste der Releases.
 
@@ -280,6 +286,28 @@ installieren — das Gerät sagt das auch so. Zum Veröffentlichen gehört also:
 ```bash
 gh release create v0.8.0 build/VoiceDot_Waveshare.ino.bin --title "v0.8.0" --notes "..."
 ```
+
+---
+
+## Lautstärke
+
+```text
+„Lautstärke 5"   setzt auf 50 %
+„leiser"         eine Stufe herunter
+„lauter"         eine Stufe herauf
+```
+
+Die Stufe ist im Webinterface einstellbar, 5 bis 25 Prozentpunkte,
+voreingestellt 10. Alle drei Befehle wertet das Gerät selbst aus, ohne Umweg
+über den Assistenten — und nur bei kurzen Äußerungen: „mach die Musik im
+Wohnzimmer leiser" gehört Home Assistant, nicht diesem Lautsprecher.
+
+### Der Deckel bei 80 %
+
+**Was die Oberfläche 100 % nennt, sind 80 % dessen, was der Codec könnte.** Das
+Lautstärkeregister des ES8311 reicht von 32 bis 255; hier ist bei 209 Schluss.
+Darüber wird abgeriegelt — auch die Anhebung nach Umgebungslärm kommt nicht
+darüber hinaus, sie stapelt sich sonst auf einen ohnehin hohen Pegel.
 
 ---
 
