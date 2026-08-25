@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.9.0";
+static const char* FW_VERSION = "0.9.1";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -7500,8 +7500,15 @@ bool updateFetchReleases() {
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    updateStatus = "GitHub antwortet mit HTTP " + String(code);
-    diagLogf("UPDATE", "release list failed code=%d", code);
+    if (code < 0) {
+      updateStatus = "Abfrage nicht moeglich, zu wenig Speicher (groesster "
+                     "freier Block " + String(ESP.getMaxAllocHeap() / 1024) +
+                     " kB). Beim naechsten Neustart wird automatisch gesucht.";
+    } else {
+      updateStatus = "GitHub antwortet mit HTTP " + String(code);
+    }
+    diagLogf("UPDATE", "release list failed code=%d maxAlloc=%lu",
+             code, (unsigned long)ESP.getMaxAllocHeap());
     http.end();
     return false;
   }
@@ -9392,15 +9399,7 @@ void setup() {
   logPrintf("Neustart-Grund: %s", resetReasonName().c_str());
   updateLoadResult();
 
-  // On an update boot the detector stays off: its DSP buffers are the biggest
-  // block of internal RAM in the way of the TLS connection to GitHub.
   bool pendingUpdate = updateHasPending();
-  if (!pendingUpdate) {
-    Serial.println("BOOT: wake word");
-    srBegin();
-  } else {
-    Serial.println("BOOT: wake word uebersprungen, Update steht an");
-  }
 
   Serial.println("BOOT: wifi");
   bool wifiOk = connectToWiFi();
@@ -9443,13 +9442,16 @@ void setup() {
 
   applySchedule(true);
 
-  if (pendingUpdate) {
-    if (wifiOk) updateRunPending();  // reboots when it worked
+  // Everything that needs TLS happens here, while the heap is still whole.
+  if (pendingUpdate && wifiOk) updateRunPending();  // reboots when it worked
 
-    // Only reached when the update did not happen.
-    Serial.println("BOOT: wake word (nach Update-Versuch)");
-    srBegin();
+  if (cfg.updateCheckEnabled && wifiOk && !apMode) {
+    Serial.println("BOOT: nach Updates sehen");
+    updateFetchReleases();
   }
+
+  Serial.println("BOOT: wake word");
+  srBegin();
 
   radioLoadStations();
   logPrintf("Radio: %u Sender gespeichert", radioStationCount);
@@ -9585,9 +9587,8 @@ void loop() {
 
   if (cfg.updateCheckEnabled && !apMode && WiFi.status() == WL_CONNECTED &&
       !wakeBusy && !ttsPlaybackActive && !updateInProgress) {
-    bool due = updateChecked
-                 ? (uint32_t)(millis() - updateCheckedAt) > UPDATE_AUTO_CHECK_MS
-                 : millis() > UPDATE_FIRST_CHECK_MS;
+    bool due = updateChecked &&
+               (uint32_t)(millis() - updateCheckedAt) > UPDATE_AUTO_CHECK_MS;
     if (due) updateFetchReleases();
   }
 
