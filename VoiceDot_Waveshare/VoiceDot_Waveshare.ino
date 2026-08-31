@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.9.3";
+static const char* FW_VERSION = "0.9.4";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -727,6 +727,7 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  bool sttHaVad;              // let Home Assistant end the sentence too
   uint8_t sttNoiseSuppression; // 0..4, Home Assistant side, 0 = off
   uint8_t sttAutoGainDb;      // 0..31 dBFS of automatic gain, 0 = off
   uint16_t sttVolumePercent;  // PCM multiplier in percent, 100 = unchanged
@@ -1291,6 +1292,7 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.sttHaVad = prefs.getBool("stt_havad", false);
   cfg.sttNoiseSuppression = constrain(prefs.getUChar("stt_ns", 2), 0, 4);
   cfg.sttAutoGainDb = constrain(prefs.getUChar("stt_agc", 24), 0, 31);
   cfg.sttVolumePercent = constrain(prefs.getUShort("stt_vol", 100), 100, 400);
@@ -1346,6 +1348,7 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putBool("stt_havad", cfg.sttHaVad);
   prefs.putUChar("stt_ns", cfg.sttNoiseSuppression);
   prefs.putUChar("stt_agc", cfg.sttAutoGainDb);
   prefs.putUShort("stt_vol", cfg.sttVolumePercent);
@@ -4098,6 +4101,14 @@ static bool assistOpen(AssistStream &st, Client *client) {
   run += ",\"noise_suppression_level\":" + String(cfg.sttNoiseSuppression);
   run += ",\"auto_gain_dbfs\":" + String(cfg.sttAutoGainDb);
   run += ",\"volume_multiplier\":" + String(cfg.sttVolumePercent / 100.0f, 2);
+
+  // This device already decides when a sentence has ended, with a pre-roll
+  // buffer and a threshold measured against the speaker's own level. Home
+  // Assistant's own detector runs on top of that and is the cruder of the two -
+  // measured, it cut a three second question after 1.4 s and the recogniser was
+  // handed a fragment. Ours stops the stream; HA transcribes what it gets.
+  if (!cfg.sttHaVad) run += ",\"no_vad\":true";
+
   run += "}";
   run += ",\"timeout\":30";
   if (cfg.haPipeline.length() > 0) {
@@ -4108,10 +4119,11 @@ static bool assistOpen(AssistStream &st, Client *client) {
   }
   run += "}";
 
-  diagLogf("ASSIST", "pipeline/run send pipeline=%s conversation=%s ns=%u agc=%u vol=%u%%",
+  diagLogf("ASSIST", "pipeline/run send pipeline=%s conversation=%s ns=%u agc=%u vol=%u%% haVad=%u",
            cfg.haPipeline.length() > 0 ? cfg.haPipeline.c_str() : "default",
            haConversationId.length() > 0 ? haConversationId.c_str() : "new",
-           cfg.sttNoiseSuppression, cfg.sttAutoGainDb, cfg.sttVolumePercent);
+           cfg.sttNoiseSuppression, cfg.sttAutoGainDb, cfg.sttVolumePercent,
+           cfg.sttHaVad ? 1 : 0);
   wsSendText(*client, run);
 
   String msg;
@@ -5435,6 +5447,17 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
   <small id="autoVolLabel" class="help">10 dB</small>
   <small id="autoVolText" class="help">-</small>
 
+  <div class="toggle" style="margin-top:10px">
+   <input id="stt_ha_vad" type="checkbox">
+   <label for="stt_ha_vad" style="margin:0">Home Assistant darf das Satzende auch bestimmen</label>
+  </div>
+  <small class="help">
+  Aus lassen. Dieses Gerät erkennt das Satzende selbst, mit Pre-Roll-Puffer und
+  einer Schwelle relativ zum Pegel des Sprechers. HAs eigene Erkennung liegt
+  darüber und ist die gröbere von beiden — sie hat hier eine dreisekündige Frage
+  nach 1,4 Sekunden abgeschnitten.
+  </small>
+
   <label>Rauschunterdrückung in Home Assistant</label>
   <input id="stt_noise_suppression" type="range" min="0" max="4" step="1" value="2"
    oninput="nsLabel.textContent=this.value==0?'aus':this.value">
@@ -5911,6 +5934,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('silLabel').textContent=($('vad_silence_ms').value/1000).toFixed(1)+' s';\n"
 " $('follow_up').checked=j.follow_up!==false;\n"
 " $('clean_markdown').checked=j.clean_markdown!==false;\n"
+" $('stt_ha_vad').checked=j.stt_ha_vad===true;\n"
 " $('stt_noise_suppression').value=j.stt_noise_suppression??2;\n"
 " $('nsLabel').textContent=$('stt_noise_suppression').value==0?'aus':$('stt_noise_suppression').value;\n"
 " $('stt_auto_gain_db').value=j.stt_auto_gain_db??24;\n"
@@ -5968,6 +5992,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
 " p.set('clean_markdown',$('clean_markdown').checked?'1':'0');\n"
+" p.set('stt_ha_vad',$('stt_ha_vad').checked?'1':'0');\n"
 " p.set('stt_noise_suppression',$('stt_noise_suppression').value);\n"
 " p.set('stt_auto_gain_db',$('stt_auto_gain_db').value);\n"
 " p.set('stt_volume_percent',$('stt_volume_percent').value);\n"
@@ -6660,6 +6685,7 @@ void handleGetConfig() {
   json += "\"timezone\":\"" + jsonEscape(cfg.timezone) + "\",";
   json += "\"ha_publish\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"clean_markdown\":" + String(cfg.cleanMarkdown ? "true" : "false") + ",";
+  json += "\"stt_ha_vad\":" + String(cfg.sttHaVad ? "true" : "false") + ",";
   json += "\"stt_noise_suppression\":" + String(cfg.sttNoiseSuppression) + ",";
   json += "\"stt_auto_gain_db\":" + String(cfg.sttAutoGainDb) + ",";
   json += "\"stt_volume_percent\":" + String(cfg.sttVolumePercent) + ",";
@@ -6790,6 +6816,10 @@ void handlePostConfig() {
   if (server.hasArg("night_brightness")) {
     cfg.nightBrightness = constrain(server.arg("night_brightness").toInt(), 0, LED_BRIGHTNESS_MAX);
     scheduleTouched = true;
+  }
+
+  if (server.hasArg("stt_ha_vad")) {
+    cfg.sttHaVad = server.arg("stt_ha_vad") == "1" || server.arg("stt_ha_vad") == "true";
   }
 
   if (server.hasArg("stt_noise_suppression")) {
