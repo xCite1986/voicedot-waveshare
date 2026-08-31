@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.9.2";
+static const char* FW_VERSION = "0.9.3";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -727,6 +727,9 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  uint8_t sttNoiseSuppression; // 0..4, Home Assistant side, 0 = off
+  uint8_t sttAutoGainDb;      // 0..31 dBFS of automatic gain, 0 = off
+  uint16_t sttVolumePercent;  // PCM multiplier in percent, 100 = unchanged
   uint8_t volumeStep;      // what "leiser" and "lauter" move by
   bool updateCheckEnabled; // ask GitHub for newer releases on its own
   bool autoVolumeEnabled;  // lift the voice when the room gets loud
@@ -1288,6 +1291,9 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.sttNoiseSuppression = constrain(prefs.getUChar("stt_ns", 2), 0, 4);
+  cfg.sttAutoGainDb = constrain(prefs.getUChar("stt_agc", 24), 0, 31);
+  cfg.sttVolumePercent = constrain(prefs.getUShort("stt_vol", 100), 100, 400);
   cfg.volumeStep = constrain(prefs.getUChar("vol_step", 10), 5, 25);
   cfg.updateCheckEnabled = prefs.getBool("upd_chk", true);
   cfg.autoVolumeEnabled = prefs.getBool("avol_on", true);
@@ -1340,6 +1346,9 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putUChar("stt_ns", cfg.sttNoiseSuppression);
+  prefs.putUChar("stt_agc", cfg.sttAutoGainDb);
+  prefs.putUShort("stt_vol", cfg.sttVolumePercent);
   prefs.putUChar("vol_step", cfg.volumeStep);
   prefs.putBool("upd_chk", cfg.updateCheckEnabled);
   prefs.putBool("avol_on", cfg.autoVolumeEnabled);
@@ -4081,7 +4090,15 @@ static bool assistOpen(AssistStream &st, Client *client) {
 
   String run = "{\"id\":1,\"type\":\"assist_pipeline/run\"";
   run += ",\"start_stage\":\"stt\",\"end_stage\":\"tts\"";
-  run += ",\"input\":{\"sample_rate\":16000}";
+  // Home Assistant defaults every one of these to off, which leaves a weak
+  // signal weak: its own voice-activity detection then ends the sentence the
+  // moment the speaker's level dips into the room noise, and the recogniser
+  // gets a fragment. Sending them is what its own voice satellites do.
+  run += ",\"input\":{\"sample_rate\":16000";
+  run += ",\"noise_suppression_level\":" + String(cfg.sttNoiseSuppression);
+  run += ",\"auto_gain_dbfs\":" + String(cfg.sttAutoGainDb);
+  run += ",\"volume_multiplier\":" + String(cfg.sttVolumePercent / 100.0f, 2);
+  run += "}";
   run += ",\"timeout\":30";
   if (cfg.haPipeline.length() > 0) {
     run += ",\"pipeline\":\"" + jsonEscape(cfg.haPipeline) + "\"";
@@ -4091,9 +4108,10 @@ static bool assistOpen(AssistStream &st, Client *client) {
   }
   run += "}";
 
-  diagLogf("ASSIST", "pipeline/run send pipeline=%s conversation=%s",
+  diagLogf("ASSIST", "pipeline/run send pipeline=%s conversation=%s ns=%u agc=%u vol=%u%%",
            cfg.haPipeline.length() > 0 ? cfg.haPipeline.c_str() : "default",
-           haConversationId.length() > 0 ? haConversationId.c_str() : "new");
+           haConversationId.length() > 0 ? haConversationId.c_str() : "new",
+           cfg.sttNoiseSuppression, cfg.sttAutoGainDb, cfg.sttVolumePercent);
   wsSendText(*client, run);
 
   String msg;
@@ -5416,6 +5434,28 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
    oninput="autoVolLabel.textContent=this.value+' dB'">
   <small id="autoVolLabel" class="help">10 dB</small>
   <small id="autoVolText" class="help">-</small>
+
+  <label>Rauschunterdrückung in Home Assistant</label>
+  <input id="stt_noise_suppression" type="range" min="0" max="4" step="1" value="2"
+   oninput="nsLabel.textContent=this.value==0?'aus':this.value">
+  <small id="nsLabel" class="help">2</small>
+
+  <label>Automatische Verstärkung</label>
+  <input id="stt_auto_gain_db" type="range" min="0" max="31" step="1" value="24"
+   oninput="agcLabel.textContent=this.value==0?'aus':this.value+' dBFS'">
+  <small id="agcLabel" class="help">24 dBFS</small>
+
+  <label>Pegel vor der Erkennung</label>
+  <input id="stt_volume_percent" type="range" min="100" max="400" step="25" value="100"
+   oninput="volMulLabel.textContent=(this.value/100).toFixed(2)+' ×'">
+  <small id="volMulLabel" class="help">1.00 ×</small>
+  <small class="help">
+  Diese drei gehen bei jeder Runde an Home Assistant mit. Ohne sie bleibt ein
+  leises Signal leise, und HAs eigene Pausenerkennung beendet den Satz, sobald
+  die Stimme ins Raumgeräusch absackt — die Erkennung bekommt dann nur ein
+  Bruchstück. Verstärkung hilft bei Abstand zum Mikrofon, Rauschunterdrückung
+  bei konstanten Störquellen. Zu viel von beidem schadet der Erkennungsrate.
+  </small>
   <small class="help">
   Läuft der Fön oder der 3D-Drucker, geht die gesprochene Antwort im Lärm unter.
   Der laufend gemessene Rauschboden hebt sie dann an — ein Dezibel Raumlärm
@@ -5871,6 +5911,12 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('silLabel').textContent=($('vad_silence_ms').value/1000).toFixed(1)+' s';\n"
 " $('follow_up').checked=j.follow_up!==false;\n"
 " $('clean_markdown').checked=j.clean_markdown!==false;\n"
+" $('stt_noise_suppression').value=j.stt_noise_suppression??2;\n"
+" $('nsLabel').textContent=$('stt_noise_suppression').value==0?'aus':$('stt_noise_suppression').value;\n"
+" $('stt_auto_gain_db').value=j.stt_auto_gain_db??24;\n"
+" $('agcLabel').textContent=$('stt_auto_gain_db').value==0?'aus':$('stt_auto_gain_db').value+' dBFS';\n"
+" $('stt_volume_percent').value=j.stt_volume_percent??100;\n"
+" $('volMulLabel').textContent=($('stt_volume_percent').value/100).toFixed(2)+' ×';\n"
 " $('volume_step').value=j.volume_step??10;\n"
 " $('volStepLabel').textContent=$('volume_step').value+' %';\n"
 " $('update_check').checked=j.update_check!==false;\n"
@@ -5922,6 +5968,9 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
 " p.set('clean_markdown',$('clean_markdown').checked?'1':'0');\n"
+" p.set('stt_noise_suppression',$('stt_noise_suppression').value);\n"
+" p.set('stt_auto_gain_db',$('stt_auto_gain_db').value);\n"
+" p.set('stt_volume_percent',$('stt_volume_percent').value);\n"
 " p.set('volume_step',$('volume_step').value);\n"
 " p.set('update_check',$('update_check').checked?'1':'0');\n"
 " p.set('auto_volume',$('auto_volume').checked?'1':'0');\n"
@@ -6611,6 +6660,9 @@ void handleGetConfig() {
   json += "\"timezone\":\"" + jsonEscape(cfg.timezone) + "\",";
   json += "\"ha_publish\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"clean_markdown\":" + String(cfg.cleanMarkdown ? "true" : "false") + ",";
+  json += "\"stt_noise_suppression\":" + String(cfg.sttNoiseSuppression) + ",";
+  json += "\"stt_auto_gain_db\":" + String(cfg.sttAutoGainDb) + ",";
+  json += "\"stt_volume_percent\":" + String(cfg.sttVolumePercent) + ",";
   json += "\"volume_step\":" + String(cfg.volumeStep) + ",";
   json += "\"update_check\":" + String(cfg.updateCheckEnabled ? "true" : "false") + ",";
   json += "\"auto_volume\":" + String(cfg.autoVolumeEnabled ? "true" : "false") + ",";
@@ -6738,6 +6790,18 @@ void handlePostConfig() {
   if (server.hasArg("night_brightness")) {
     cfg.nightBrightness = constrain(server.arg("night_brightness").toInt(), 0, LED_BRIGHTNESS_MAX);
     scheduleTouched = true;
+  }
+
+  if (server.hasArg("stt_noise_suppression")) {
+    cfg.sttNoiseSuppression = constrain(server.arg("stt_noise_suppression").toInt(), 0, 4);
+  }
+
+  if (server.hasArg("stt_auto_gain_db")) {
+    cfg.sttAutoGainDb = constrain(server.arg("stt_auto_gain_db").toInt(), 0, 31);
+  }
+
+  if (server.hasArg("stt_volume_percent")) {
+    cfg.sttVolumePercent = constrain(server.arg("stt_volume_percent").toInt(), 100, 400);
   }
 
   if (server.hasArg("volume_step")) {
