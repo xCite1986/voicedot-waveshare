@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.9.4";
+static const char* FW_VERSION = "0.9.5";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -281,6 +281,13 @@ static constexpr float VAD_RELEASE_MARGIN_DB = 3.0f;
 // frame still counts as speech. Quiet syllables and trailing consonants sit
 // far below the peak but well above the room.
 static constexpr float VAD_SPEECH_DROP_DB = 22.0f;
+
+// What one frame above the release threshold costs in accumulated silence.
+// Resetting the silence clock outright was the old behaviour, and in a room
+// whose own noise straddles that threshold it never got past 50 ms of a needed
+// 1400. Speech produces frames in runs and still drains the clock in a few
+// hundred milliseconds; a lone blip only sets it back this far.
+static constexpr uint32_t VAD_BLIP_CREDIT_MS = 120;
 static constexpr float VAD_MIN_SPEECH_DB = -52.0f;
 static constexpr float VAD_NOISE_FLOOR_START_DB = -70.0f;
 static constexpr float VAD_NOISE_FLOOR_MAX_DB = -30.0f;
@@ -4306,8 +4313,12 @@ static bool assistRecordAndStream(AssistStream &st) {
         lastRelease = release;
 
         if (db > release) {
-          lastVoiceMs = now;
           voiceFrames++;
+
+          // Move the silence clock back instead of zeroing it, so a single
+          // noise spike cannot erase a second of accumulated quiet.
+          uint32_t accumulated = now - lastVoiceMs;
+          lastVoiceMs += min<uint32_t>(accumulated, VAD_BLIP_CREDIT_MS);
         }
 
         if (cfg.vadEnabled) {
