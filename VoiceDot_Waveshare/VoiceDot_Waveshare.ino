@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.9.5";
+static const char* FW_VERSION = "0.9.6";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -734,6 +734,7 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  uint8_t micGainDb;          // ES7210 analogue gain, 0..36 dB
   bool sttHaVad;              // let Home Assistant end the sentence too
   uint8_t sttNoiseSuppression; // 0..4, Home Assistant side, 0 = off
   uint8_t sttAutoGainDb;      // 0..31 dBFS of automatic gain, 0 = off
@@ -1299,6 +1300,7 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.micGainDb = constrain(prefs.getUChar("mic_gain", 30), 0, 36);
   cfg.sttHaVad = prefs.getBool("stt_havad", false);
   cfg.sttNoiseSuppression = constrain(prefs.getUChar("stt_ns", 2), 0, 4);
   cfg.sttAutoGainDb = constrain(prefs.getUChar("stt_agc", 24), 0, 31);
@@ -1355,6 +1357,7 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putUChar("mic_gain", cfg.micGainDb);
   prefs.putBool("stt_havad", cfg.sttHaVad);
   prefs.putUChar("stt_ns", cfg.sttNoiseSuppression);
   prefs.putUChar("stt_agc", cfg.sttAutoGainDb);
@@ -1911,10 +1914,22 @@ uint8_t es7210GainReg(float db) {
   return 14;
 }
 
+// The two microphone channels share one setting. Writable while running, so a
+// gain that turns out too low does not need a reboot to correct.
+bool es7210ApplyGain(uint8_t db) {
+  if (!es7210Present) return false;
+
+  uint8_t reg = es7210GainReg((float)db);
+  bool ok = codecWrite(ADDR_ES7210, 0x43, 0x10 | reg);
+  ok &= codecWrite(ADDR_ES7210, 0x44, 0x10 | reg);
+  diagLogf("MIC", "gain set to %u dB (register 0x%02X) ok=%u", db, 0x10 | reg, ok ? 1 : 0);
+  return ok;
+}
+
 bool setupEs7210() {
   if (!es7210Present) return false;
 
-  const uint8_t gain = es7210GainReg(30.0f);
+  const uint8_t gain = es7210GainReg((float)cfg.micGainDb);
   bool ok = true;
 
   ok &= codecWrite(ADDR_ES7210, 0x00, 0xFF);
@@ -5458,6 +5473,16 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
   <small id="autoVolLabel" class="help">10 dB</small>
   <small id="autoVolText" class="help">-</small>
 
+  <label>Mikrofonverstärkung</label>
+  <input id="mic_gain_db" type="range" min="0" max="36" step="3" value="30"
+   oninput="micGainLabel.textContent=this.value+' dB'">
+  <small id="micGainLabel" class="help">30 dB</small>
+  <small class="help">
+  Wirkt sofort, ohne Neustart. Hebt Stimme und Raumgeräusch gleichermaßen an —
+  gegen ein schlechtes Verhältnis der beiden hilft sie also nicht, wohl aber
+  gegen einen insgesamt zu leisen Eingang.
+  </small>
+
   <div class="toggle" style="margin-top:10px">
    <input id="stt_ha_vad" type="checkbox">
    <label for="stt_ha_vad" style="margin:0">Home Assistant darf das Satzende auch bestimmen</label>
@@ -5945,6 +5970,8 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " $('silLabel').textContent=($('vad_silence_ms').value/1000).toFixed(1)+' s';\n"
 " $('follow_up').checked=j.follow_up!==false;\n"
 " $('clean_markdown').checked=j.clean_markdown!==false;\n"
+" $('mic_gain_db').value=j.mic_gain_db??30;\n"
+" $('micGainLabel').textContent=$('mic_gain_db').value+' dB';\n"
 " $('stt_ha_vad').checked=j.stt_ha_vad===true;\n"
 " $('stt_noise_suppression').value=j.stt_noise_suppression??2;\n"
 " $('nsLabel').textContent=$('stt_noise_suppression').value==0?'aus':$('stt_noise_suppression').value;\n"
@@ -6003,6 +6030,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
 " p.set('clean_markdown',$('clean_markdown').checked?'1':'0');\n"
+" p.set('mic_gain_db',$('mic_gain_db').value);\n"
 " p.set('stt_ha_vad',$('stt_ha_vad').checked?'1':'0');\n"
 " p.set('stt_noise_suppression',$('stt_noise_suppression').value);\n"
 " p.set('stt_auto_gain_db',$('stt_auto_gain_db').value);\n"
@@ -6696,6 +6724,7 @@ void handleGetConfig() {
   json += "\"timezone\":\"" + jsonEscape(cfg.timezone) + "\",";
   json += "\"ha_publish\":" + String(cfg.haPublish ? "true" : "false") + ",";
   json += "\"clean_markdown\":" + String(cfg.cleanMarkdown ? "true" : "false") + ",";
+  json += "\"mic_gain_db\":" + String(cfg.micGainDb) + ",";
   json += "\"stt_ha_vad\":" + String(cfg.sttHaVad ? "true" : "false") + ",";
   json += "\"stt_noise_suppression\":" + String(cfg.sttNoiseSuppression) + ",";
   json += "\"stt_auto_gain_db\":" + String(cfg.sttAutoGainDb) + ",";
@@ -6827,6 +6856,11 @@ void handlePostConfig() {
   if (server.hasArg("night_brightness")) {
     cfg.nightBrightness = constrain(server.arg("night_brightness").toInt(), 0, LED_BRIGHTNESS_MAX);
     scheduleTouched = true;
+  }
+
+  if (server.hasArg("mic_gain_db")) {
+    cfg.micGainDb = constrain(server.arg("mic_gain_db").toInt(), 0, 36);
+    es7210ApplyGain(cfg.micGainDb);
   }
 
   if (server.hasArg("stt_ha_vad")) {
@@ -9266,6 +9300,28 @@ void handleRadioDelete() {
   server.send(200, "text/plain; charset=utf-8", name + " geloescht.");
 }
 
+// Reading the codec back is the only way to tell a setting that was applied
+// from one that was merely intended.
+void handleMicInfo() {
+  String json = "{\"present\":" + String(es7210Present ? "true" : "false");
+  json += ",\"configured_gain_db\":" + String(cfg.micGainDb);
+  json += ",\"expected_register\":" + String(0x10 | es7210GainReg((float)cfg.micGainDb));
+  json += ",\"registers\":{";
+
+  const uint8_t regs[] = {0x01, 0x02, 0x07, 0x20, 0x21, 0x22, 0x23,
+                          0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46};
+  bool first = true;
+  for (uint8_t i = 0; i < sizeof(regs); i++) {
+    uint8_t value = 0;
+    bool ok = codecRead(ADDR_ES7210, regs[i], value);
+    if (!first) json += ",";
+    first = false;
+    json += "\"0x" + String(regs[i], HEX) + "\":" + (ok ? String(value) : String(-1));
+  }
+  json += "}}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
 void handleAdcScan() {
   String json = "{";
 
@@ -9430,6 +9486,7 @@ void setupWebServer() {
   // HTTP_ANY so a plain browser URL works too:
   //   http://<host>/api/announce?text=Hallo
   server.on("/api/announce", HTTP_ANY, handleAnnounce);
+  server.on("/api/hardware/mic-info", HTTP_GET, handleMicInfo);
   server.on("/api/hardware/adc-scan", HTTP_GET, handleAdcScan);
   server.on("/api/update/check", HTTP_ANY, handleUpdateCheck);
   server.on("/api/update/install", HTTP_ANY, handleUpdateInstall);
