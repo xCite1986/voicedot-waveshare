@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.9.6";
+static const char* FW_VERSION = "0.10.0";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -509,6 +509,17 @@ uint8_t radioChannels = 0;
 uint8_t radioReconnects = 0;
 bool radioUsingTls = false;
 
+// Alarm and timer. The alarm survives a reboot in the config, the timer does
+// not - a countdown that resumes after a restart is a surprise, not a feature.
+int alarmFiredDay = -1;
+bool alarmRinging = false;
+time_t timerEndsAt = 0;
+uint32_t timerTotalSec = 0;
+
+// A locally handled command can have something to say. Spoken instead of the
+// acknowledgement chime, so "noch zwei Minuten" reaches the room.
+String wakeAnnounceText = "";
+
 // A "spiele ..." we could not resolve turns into a question of our own.
 bool radioAskPending = false;
 String radioAskText = "";
@@ -734,6 +745,11 @@ struct Config {
   String timezone;
   bool haPublish;       // push our state into Home Assistant
   bool cleanMarkdown;   // re-render answers without Markdown before speaking
+  int16_t alarmMinutes;       // minutes since midnight, -1 = no alarm
+  bool alarmDaily;            // ring again the next day
+  String alarmSound;          // file from the sound library
+  String alarmBriefing;       // spoken after the sound
+  String timerSound;          // file for the timer
   uint8_t micGainDb;          // ES7210 analogue gain, 0..36 dB
   bool sttHaVad;              // let Home Assistant end the sentence too
   uint8_t sttNoiseSuppression; // 0..4, Home Assistant side, 0 = off
@@ -767,6 +783,11 @@ bool playSoundFile(const String &name);
 static String multiOwnId();
 static float multiWakeScore();
 static bool radioHandleVoiceCommand(const String &lower);
+static bool alarmTimerVoiceCommand(const String &lower);
+void alarmTimerTick();
+static String clockText(int minutes);
+static long alarmSecondsUntil();
+static long timerSecondsLeft();
 bool updateFetchReleases();
 static int updateNewestIndex();
 static bool updateIsNewer(const String &tag);
@@ -1053,6 +1074,7 @@ static bool handleLocalVoiceCommand(const String &text) {
   // music anyway.
   if (radioHandleVoiceCommand(lower)) return true;
   if (volumeStepVoiceCommand(lower)) return true;
+  if (alarmTimerVoiceCommand(lower)) return true;
 
   // The command has to *be* the sentence, not appear somewhere inside it.
   // Otherwise "stell die Lautstärke im Wohnzimmer auf 5" would turn this
@@ -1300,6 +1322,11 @@ void loadConfig() {
   cfg.nightBrightness = constrain(prefs.getUChar("night_bri", 30), 0, LED_BRIGHTNESS_MAX);
   cfg.haPublish = prefs.getBool("ha_publish", false);
   cfg.cleanMarkdown = prefs.getBool("clean_md", true);
+  cfg.alarmMinutes = prefs.getShort("alrm_min", -1);
+  cfg.alarmDaily = prefs.getBool("alrm_day", false);
+  cfg.alarmSound = prefs.getString("alrm_snd", "");
+  cfg.alarmBriefing = prefs.getString("alrm_brf", "");
+  cfg.timerSound = prefs.getString("tmr_snd", "");
   cfg.micGainDb = constrain(prefs.getUChar("mic_gain", 30), 0, 36);
   cfg.sttHaVad = prefs.getBool("stt_havad", false);
   cfg.sttNoiseSuppression = constrain(prefs.getUChar("stt_ns", 2), 0, 4);
@@ -1357,6 +1384,11 @@ void saveConfig() {
   prefs.putUChar("night_bri", cfg.nightBrightness);
   prefs.putBool("ha_publish", cfg.haPublish);
   prefs.putBool("clean_md", cfg.cleanMarkdown);
+  prefs.putShort("alrm_min", cfg.alarmMinutes);
+  prefs.putBool("alrm_day", cfg.alarmDaily);
+  prefs.putString("alrm_snd", cfg.alarmSound);
+  prefs.putString("alrm_brf", cfg.alarmBriefing);
+  prefs.putString("tmr_snd", cfg.timerSound);
   prefs.putUChar("mic_gain", cfg.micGainDb);
   prefs.putBool("stt_havad", cfg.sttHaVad);
   prefs.putUChar("stt_ns", cfg.sttNoiseSuppression);
@@ -4095,6 +4127,7 @@ static bool assistOpen(AssistStream &st, Client *client) {
   wakeTtsStatus = "-";
   wakeLastBytes = 0;
   localCommandHandled = false;
+  wakeAnnounceText = "";
   setLedPhase(LED_PHASE_THINK);
 
   if (!wsConnectHa(*client, host, port, cfg.haToken)) {
@@ -4468,8 +4501,19 @@ static bool assistFinish(AssistStream &st) {
 
   if (localCommandHandled) {
     wakeLastState = "done";
-    wakeTtsStatus = "lokaler Befehl, keine TTS";
     setLedPhase(LED_PHASE_SPEAK);
+
+    if (wakeAnnounceText.length() > 0) {
+      String say = wakeAnnounceText;
+      wakeAnnounceText = "";
+      wakeAssistantText = say;
+      wakeTtsStatus = "lokaler Befehl, eigene Ansage";
+      playAnnouncement(say);
+      diagLog("ASSIST", "local command answered locally");
+      return true;
+    }
+
+    wakeTtsStatus = "lokaler Befehl, keine TTS";
     playAckChime();
     diagLog("ASSIST", "local command handled, HA answer skipped");
     return true;
@@ -5463,6 +5507,19 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
   </div>
   <small id="noiseText" class="help">Rauschboden ...</small>
 
+   <small id="autoVolText" class="help">-</small>
+  </div>
+ </div>
+
+<div class="row">
+ <div>
+  <h3 style="margin:4px 0 8px;font-size:12px;letter-spacing:.08em;opacity:.65">AM GERÄT</h3>
+
+  <label>Mikrofonverstärkung</label>
+  <input id="mic_gain_db" type="range" min="0" max="36" step="3" value="30"
+   oninput="micGainLabel.textContent=this.value+' dB'">
+  <small id="micGainLabel" class="help">30 dB</small>
+
   <div class="toggle" style="margin-top:10px">
    <input id="auto_volume" type="checkbox" checked>
    <label for="auto_volume" style="margin:0">Lautstärke an das Umfeld anpassen</label>
@@ -5471,59 +5528,48 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
   <input id="auto_volume_max_db" type="range" min="0" max="18" step="1" value="10"
    oninput="autoVolLabel.textContent=this.value+' dB'">
   <small id="autoVolLabel" class="help">10 dB</small>
-  <small id="autoVolText" class="help">-</small>
-
-  <label>Mikrofonverstärkung</label>
-  <input id="mic_gain_db" type="range" min="0" max="36" step="3" value="30"
-   oninput="micGainLabel.textContent=this.value+' dB'">
-  <small id="micGainLabel" class="help">30 dB</small>
-  <small class="help">
-  Wirkt sofort, ohne Neustart. Hebt Stimme und Raumgeräusch gleichermaßen an —
-  gegen ein schlechtes Verhältnis der beiden hilft sie also nicht, wohl aber
-  gegen einen insgesamt zu leisen Eingang.
-  </small>
 
   <div class="toggle" style="margin-top:10px">
    <input id="stt_ha_vad" type="checkbox">
-   <label for="stt_ha_vad" style="margin:0">Home Assistant darf das Satzende auch bestimmen</label>
+   <label for="stt_ha_vad" style="margin:0">HA darf das Satzende mitbestimmen</label>
   </div>
-  <small class="help">
-  Aus lassen. Dieses Gerät erkennt das Satzende selbst, mit Pre-Roll-Puffer und
-  einer Schwelle relativ zum Pegel des Sprechers. HAs eigene Erkennung liegt
-  darüber und ist die gröbere von beiden — sie hat hier eine dreisekündige Frage
-  nach 1,4 Sekunden abgeschnitten.
-  </small>
+ </div>
+ <div>
+  <h3 style="margin:4px 0 8px;font-size:12px;letter-spacing:.08em;opacity:.65">IN HOME ASSISTANT</h3>
 
-  <label>Rauschunterdrückung in Home Assistant</label>
-  <input id="stt_noise_suppression" type="range" min="0" max="4" step="1" value="2"
-   oninput="nsLabel.textContent=this.value==0?'aus':this.value">
-  <small id="nsLabel" class="help">2</small>
+  <label>Pegel vor der Erkennung</label>
+  <input id="stt_volume_percent" type="range" min="100" max="400" step="25" value="100"
+   oninput="volMulLabel.textContent=(this.value/100).toFixed(2)+' ×'">
+  <small id="volMulLabel" class="help">1.00 ×</small>
 
   <label>Automatische Verstärkung</label>
   <input id="stt_auto_gain_db" type="range" min="0" max="31" step="1" value="24"
    oninput="agcLabel.textContent=this.value==0?'aus':this.value+' dBFS'">
   <small id="agcLabel" class="help">24 dBFS</small>
 
-  <label>Pegel vor der Erkennung</label>
-  <input id="stt_volume_percent" type="range" min="100" max="400" step="25" value="100"
-   oninput="volMulLabel.textContent=(this.value/100).toFixed(2)+' ×'">
-  <small id="volMulLabel" class="help">1.00 ×</small>
-  <small class="help">
-  Diese drei gehen bei jeder Runde an Home Assistant mit. Ohne sie bleibt ein
-  leises Signal leise, und HAs eigene Pausenerkennung beendet den Satz, sobald
-  die Stimme ins Raumgeräusch absackt — die Erkennung bekommt dann nur ein
-  Bruchstück. Verstärkung hilft bei Abstand zum Mikrofon, Rauschunterdrückung
-  bei konstanten Störquellen. Zu viel von beidem schadet der Erkennungsrate.
-  </small>
-  <small class="help">
-  Läuft der Fön oder der 3D-Drucker, geht die gesprochene Antwort im Lärm unter.
-  Der laufend gemessene Rauschboden hebt sie dann an — ein Dezibel Raumlärm
-  kostet ein Dezibel Sprache, gedeckelt auf den eingestellten Wert. Gemessen
-  wird nur, solange der eigene Lautsprecher still ist; Musik wird nicht
-  angehoben.
-  </small>
+  <label>Rauschunterdrückung</label>
+  <input id="stt_noise_suppression" type="range" min="0" max="4" step="1" value="2"
+   oninput="nsLabel.textContent=this.value==0?'aus':this.value">
+  <small id="nsLabel" class="help">2</small>
  </div>
 </div>
+
+<small class="help">
+<b>Am Gerät:</b> Die Mikrofonverstärkung hebt Stimme und Raumgeräusch gleichermaßen
+an — gegen ein schlechtes Verhältnis der beiden hilft sie nicht, wohl aber gegen
+einen insgesamt zu leisen Eingang. Die Anpassung ans Umfeld hebt umgekehrt nur die
+<i>Ausgabe</i> an, wenn der Raum laut wird; gemessen wird dafür nur, solange der
+eigene Lautsprecher still ist.<br>
+<b>Das Satzende</b> erkennt dieses Gerät selbst, mit Pre-Roll-Puffer und einer
+Schwelle relativ zum Pegel des Sprechers. Home Assistant zusätzlich mitreden zu
+lassen ist die gröbere Variante — sie hat hier eine dreisekündige Frage nach
+1,4 Sekunden abgeschnitten. Aus lassen.<br>
+<b>In Home Assistant:</b> Diese drei gehen bei jeder Runde mit. Der Pegel
+multipliziert die Abtastwerte direkt und wirkt am stärksten, die automatische
+Verstärkung arbeitet danach. Rauschunterdrückung hilft bei konstanten
+Störquellen, zu viel davon schadet der Erkennungsrate.
+</small>
+
 <div class="pinbox" id="pinbox">Lade Pinbelegung ...</div>
 <div class="pinbox" id="assistBox">Assist bereit ...</div>
 <div class="pinbox" id="wakeBox">Wake-Word ...</div>
@@ -5658,6 +5704,56 @@ Gerät — kein USB-Kabel nötig. Geschrieben wird immer in die gerade nicht
 laufende Partition; geht dabei etwas schief, bleibt die alte Version bestehen.
 Einstellungen, Klänge und Sender überleben das Update, die Wake-Word-Modelle
 liegen in einer eigenen Partition und werden nicht mit angefasst.
+</small>
+</section>
+
+<section class="card full">
+<h2>WECKER &amp; TIMER</h2>
+<div class="pinbox" id="alarmBox" style="min-height:40px">Lade ...</div>
+
+<div class="row">
+ <div>
+  <h3 style="margin:4px 0 8px;font-size:12px;letter-spacing:.08em;opacity:.65">WECKER</h3>
+  <label>Weckzeit</label>
+  <div style="display:flex;gap:8px">
+   <input id="alarmTime" type="time" style="flex:1">
+   <button type="button" onclick="alarmSave()">Stellen</button>
+   <button type="button" class="danger" onclick="alarmClear()">Löschen</button>
+  </div>
+  <div class="toggle" style="margin-top:10px">
+   <input id="alarm_daily" type="checkbox">
+   <label for="alarm_daily" style="margin:0">Jeden Tag wiederholen</label>
+  </div>
+  <label>Weckton</label>
+  <select id="alarm_sound"><option value="">— keiner —</option></select>
+ </div>
+ <div>
+  <h3 style="margin:4px 0 8px;font-size:12px;letter-spacing:.08em;opacity:.65">TIMER</h3>
+  <label>Laufzeit in Minuten</label>
+  <div style="display:flex;gap:8px">
+   <input id="timerMinutes" type="number" min="1" max="720" value="10" style="flex:1">
+   <button type="button" onclick="timerStart()">Starten</button>
+   <button type="button" class="danger" onclick="timerStop()">Stoppen</button>
+  </div>
+  <label>Ton bei Ablauf</label>
+  <select id="timer_sound"><option value="">— Ansage —</option></select>
+ </div>
+</div>
+
+<label>Morgen-Briefing</label>
+<textarea id="alarm_briefing" rows="3"
+ placeholder="Guten Morgen. [dingdong.mp3] Es ist Zeit aufzustehen."></textarea>
+<div class="actions"><button class="secondary" onclick="alarmSaveOptions()">Briefing und Töne speichern</button></div>
+
+<small class="help">
+Gesprochen: <b>„Stelle den Wecker auf 7 Uhr 30"</b>, <b>„Wecker löschen"</b>,
+<b>„Wann klingelt der Wecker"</b> — und <b>„Stelle den Timer auf 10 Minuten"</b>,
+<b>„Wie lange noch"</b>, <b>„Timer abbrechen"</b>. Alles wertet das Gerät selbst
+aus, ohne Umweg über den Assistenten; der Wecker klingelt deshalb auch, wenn
+Home Assistant gerade nicht erreichbar ist.<br>
+Zuerst spielt der Weckton, danach wird das Briefing gesprochen — Klänge aus der
+Bibliothek lassen sich darin wie bei einer Ansage voranstellen. Der Timer läuft
+nur im Arbeitsspeicher und ist nach einem Neustart weg; der Wecker bleibt.
 </small>
 </section>
 
@@ -6171,6 +6267,82 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "\n"
 "function clearLog(){logBuf=[];$('logBox').textContent='';}\n"
 "\n"
+"async function refreshAlarm(){\n"
+" try{\n"
+"  const a=await (await fetch('/api/alarm',{cache:'no-store'})).json();\n"
+"  const t=await (await fetch('/api/timer',{cache:'no-store'})).json();\n"
+"  const hhmm=x=>{const h=Math.floor(x/3600),m=Math.floor(x%3600/60),s=x%60;\n"
+"   return (h?h+' h ':'')+(h||m?m+' min ':'')+s+' s';};\n"
+"  $('alarmBox').textContent=\n"
+"   'WECKER  '+(a.set?(a.time+' Uhr'+(a.daily?' , taeglich':'')+\n"
+"     (a.seconds_until>0?'   in '+hhmm(a.seconds_until):'')):'nicht gestellt')+'\\n'+\n"
+"   'TIMER   '+(t.active?('noch '+hhmm(t.remaining_s)+'   von '+hhmm(t.total_s)):'laeuft nicht');\n"
+"  if(document.activeElement!==$('alarmTime')&&a.set)$('alarmTime').value=a.time;\n"
+"  $('alarm_daily').checked=a.daily===true;\n"
+"  if(document.activeElement!==$('alarm_briefing'))$('alarm_briefing').value=a.briefing||'';\n"
+"  await fillSoundSelects(a.sound||'',t.sound||'');\n"
+" }catch(e){}\n"
+"}\n"
+"\n"
+"async function fillSoundSelects(alarmSel,timerSel){\n"
+" try{\n"
+"  const j=await (await fetch('/api/sound/list',{cache:'no-store'})).json();\n"
+"  [['alarm_sound',alarmSel,'— keiner —'],['timer_sound',timerSel,'— Ansage —']]\n"
+"   .forEach(([id,sel,none])=>{\n"
+"   const el=$(id);\n"
+"   if(el.dataset.n==String((j.files||[]).length)&&el.value===sel)return;\n"
+"   el.innerHTML='';\n"
+"   const o0=document.createElement('option');o0.value='';o0.textContent=none;\n"
+"   el.appendChild(o0);\n"
+"   (j.files||[]).forEach(f=>{\n"
+"    const o=document.createElement('option');o.value=f.name;o.textContent=f.name;\n"
+"    el.appendChild(o);});\n"
+"   el.value=sel;el.dataset.n=String((j.files||[]).length);\n"
+"  });\n"
+" }catch(e){}\n"
+"}\n"
+"\n"
+"async function alarmSave(){\n"
+" const v=$('alarmTime').value;\n"
+" if(!v){toast('Bitte eine Uhrzeit waehlen.');return;}\n"
+" const p=new URLSearchParams();p.set('time',v);\n"
+" p.set('daily',$('alarm_daily').checked?'1':'0');\n"
+" const r=await fetch('/api/alarm',{method:'POST',\n"
+"  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
+" toast(await r.text());refreshAlarm();\n"
+"}\n"
+"\n"
+"async function alarmClear(){\n"
+" const r=await fetch('/api/alarm?clear=1',{method:'POST'});\n"
+" toast(await r.text());refreshAlarm();\n"
+"}\n"
+"\n"
+"async function alarmSaveOptions(){\n"
+" const p=new URLSearchParams();\n"
+" p.set('sound',$('alarm_sound').value);\n"
+" p.set('briefing',$('alarm_briefing').value);\n"
+" p.set('daily',$('alarm_daily').checked?'1':'0');\n"
+" const r=await fetch('/api/alarm',{method:'POST',\n"
+"  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
+" toast(await r.text());\n"
+" const q=new URLSearchParams();q.set('sound',$('timer_sound').value);\n"
+" await fetch('/api/timer',{method:'POST',\n"
+"  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q.toString()});\n"
+" refreshAlarm();\n"
+"}\n"
+"\n"
+"async function timerStart(){\n"
+" const m=parseInt($('timerMinutes').value||'0',10);\n"
+" if(!m){toast('Bitte Minuten angeben.');return;}\n"
+" const r=await fetch('/api/timer?minutes='+m,{method:'POST'});\n"
+" toast(await r.text());refreshAlarm();\n"
+"}\n"
+"\n"
+"async function timerStop(){\n"
+" const r=await fetch('/api/timer?clear=1',{method:'POST'});\n"
+" toast(await r.text());refreshAlarm();\n"
+"}\n"
+"\n"
 "async function refreshRadio(){\n"
 " try{\n"
 "  const r=await fetch('/api/radio/list',{cache:'no-store'});\n"
@@ -6395,7 +6567,9 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "refreshLog();\n"
 "refreshSounds();\n"
 "refreshRadio();\n"
+"refreshAlarm();\n"
 "setInterval(refreshRadio,5000);\n"
+"setInterval(refreshAlarm,2000);\n"
 "setInterval(refreshStatus,3000);\n"
 "setInterval(refreshLog,1500);\n"
 "\n"
@@ -6607,6 +6781,24 @@ void handleStatus() {
   json += "\"boost_db\":" + String(autoVolumeBoostDb(), 1) + ",";
   json += "\"last_boost_db\":" + String(autoVolumeLastBoost, 1) + ",";
   json += "\"age_s\":" + String(autoVolumeNoiseValid ? (millis() - autoVolumeNoiseAt) / 1000UL : 0UL);
+  json += "},";
+
+  json += "\"alarm\":{";
+  json += "\"set\":" + String(cfg.alarmMinutes >= 0 ? "true" : "false") + ",";
+  json += "\"time\":\"" + clockText(cfg.alarmMinutes) + "\",";
+  json += "\"minutes\":" + String(cfg.alarmMinutes) + ",";
+  json += "\"daily\":" + String(cfg.alarmDaily ? "true" : "false") + ",";
+  json += "\"seconds_until\":" + String(alarmSecondsUntil()) + ",";
+  json += "\"ringing\":" + String(alarmRinging ? "true" : "false") + ",";
+  json += "\"sound\":\"" + jsonEscape(cfg.alarmSound) + "\",";
+  json += "\"briefing\":\"" + jsonEscape(cfg.alarmBriefing) + "\"";
+  json += "},";
+
+  json += "\"timer\":{";
+  json += "\"active\":" + String(timerEndsAt != 0 ? "true" : "false") + ",";
+  json += "\"remaining_s\":" + String(timerSecondsLeft()) + ",";
+  json += "\"total_s\":" + String(timerTotalSec) + ",";
+  json += "\"sound\":\"" + jsonEscape(cfg.timerSound) + "\"";
   json += "},";
 
   json += "\"radio\":{";
@@ -8712,6 +8904,287 @@ static bool radioHandleVoiceCommand(const String &lower) {
 }
 
 // -----------------------------------------------------------------------------
+// Alarm clock and timer
+//
+// Both live on the device rather than in Home Assistant: they have to ring even
+// when the network is down, and a countdown that depends on a round trip to a
+// language model is not a countdown.
+// -----------------------------------------------------------------------------
+
+// German speech-to-text writes small numbers either way, so both are accepted.
+// Returns -1 when nothing number-like is found from `start` onwards.
+static int spokenNumberAt(const String &text, int start, int *beginsAt, int *endsAt) {
+  static const char *words[] = {
+    "null", "eins", "zwei", "drei", "vier", "fuenf", "sechs", "sieben",
+    "acht", "neun", "zehn", "elf", "zwoelf", "dreizehn", "vierzehn",
+    "fuenfzehn", "sechzehn", "siebzehn", "achtzehn", "neunzehn", "zwanzig"
+  };
+
+  for (int i = start; i < (int)text.length(); i++) {
+    if (isdigit((unsigned char)text[i])) {
+      int value = 0;
+      int j = i;
+      while (j < (int)text.length() && isdigit((unsigned char)text[j])) {
+        value = value * 10 + (text[j] - '0');
+        j++;
+        if (value > 9999) break;
+      }
+      if (beginsAt) *beginsAt = i;
+      if (endsAt) *endsAt = j;
+      return value;
+    }
+  }
+
+  // No digits: try the words. Longest first so "sechzehn" beats "sechs".
+  int best = -1;
+  int bestPos = -1;
+  int bestEnd = -1;
+  for (int n = 20; n >= 0; n--) {
+    int at = text.indexOf(words[n], start);
+    if (at < 0) continue;
+    if (bestPos < 0 || at < bestPos) {
+      bestPos = at;
+      best = n;
+      bestEnd = at + strlen(words[n]);
+    }
+  }
+  if (best >= 0) {
+    if (beginsAt) *beginsAt = bestPos;
+    if (endsAt) *endsAt = bestEnd;
+  }
+  return best;
+}
+
+// "7:30", "7 uhr 30", "sieben uhr" - all of them end up as minutes since
+// midnight. -1 when the sentence carries no usable time.
+static int parseSpokenClock(const String &norm) {
+  int hourBegin = 0;
+  int hourEnd = 0;
+  int hour = spokenNumberAt(norm, 0, &hourBegin, &hourEnd);
+  if (hour < 0 || hour > 23) return -1;
+
+  int minute = 0;
+
+  // A second number after the hour is the minute, but only when it follows
+  // closely: "7 uhr 30" and "07 30" qualify, "7 uhr ... 30 grad" does not.
+  // Five characters cover the " uhr " that sits between them.
+  int minuteBegin = 0;
+  int minuteEnd = 0;
+  int candidate = spokenNumberAt(norm, hourEnd, &minuteBegin, &minuteEnd);
+  if (candidate >= 0 && candidate <= 59 && (minuteBegin - hourEnd) <= 5) {
+    minute = candidate;
+  }
+
+  return hour * 60 + minute;
+}
+
+static String clockText(int minutes) {
+  if (minutes < 0) return "-";
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02d:%02d", minutes / 60, minutes % 60);
+  return String(buf);
+}
+
+// localMinutesNow() belongs to the day/night schedule and is reused here.
+static int localDayNow() {
+  struct tm t;
+  if (!getLocalTime(&t, 5)) return -1;
+  return t.tm_yday;
+}
+
+// -------------------------------------------------------------------- alarm
+
+static void alarmClear(const char *why) {
+  cfg.alarmMinutes = -1;
+  alarmFiredDay = -1;
+  saveConfig();
+  diagLogf("ALARM", "cleared: %s", why ? why : "-");
+}
+
+static void alarmSet(int minutes) {
+  cfg.alarmMinutes = constrain(minutes, 0, 1439);
+  alarmFiredDay = -1;
+
+  // Setting the alarm to a time that has already passed today means tomorrow,
+  // and that falls out of the fired-day bookkeeping on its own.
+  saveConfig();
+  logPrintf("Wecker gestellt auf %s", clockText(cfg.alarmMinutes).c_str());
+}
+
+// Whole minutes until it rings, for the interface and for Home Assistant.
+static long alarmSecondsUntil() {
+  if (cfg.alarmMinutes < 0) return -1;
+  int now = localMinutesNow();
+  if (now < 0) return -1;
+
+  int delta = cfg.alarmMinutes - now;
+  if (delta <= 0) delta += 24 * 60;
+  return (long)delta * 60;
+}
+
+static void alarmFire() {
+  alarmFiredDay = localDayNow();
+  if (!cfg.alarmDaily) cfg.alarmMinutes = -1;
+  saveConfig();
+
+  logPrintf("Wecker klingelt (%s)", clockText(cfg.alarmMinutes).c_str());
+  alarmRinging = true;
+
+  if (cfg.alarmSound.length() > 0) playSoundFile(cfg.alarmSound);
+
+  // The briefing is spoken after the sound, so the sound stays the thing that
+  // wakes you and the words are for once you are awake.
+  if (cfg.alarmBriefing.length() > 0) playAnnouncement(cfg.alarmBriefing);
+
+  alarmRinging = false;
+}
+
+// -------------------------------------------------------------------- timer
+
+static void timerClear(const char *why) {
+  timerEndsAt = 0;
+  timerTotalSec = 0;
+  diagLogf("TIMER", "cleared: %s", why ? why : "-");
+}
+
+static void timerSet(uint32_t seconds) {
+  if (seconds == 0) { timerClear("auf null gesetzt"); return; }
+
+  timerTotalSec = seconds;
+  timerEndsAt = time(nullptr) + (time_t)seconds;
+  logPrintf("Timer gestellt auf %lu Sekunden", (unsigned long)seconds);
+}
+
+static long timerSecondsLeft() {
+  if (timerEndsAt == 0) return -1;
+  long left = (long)(timerEndsAt - time(nullptr));
+  return left > 0 ? left : 0;
+}
+
+// "noch 2 Minuten und 30 Sekunden" reads better than "150 Sekunden".
+static String timerSpokenRemaining() {
+  long left = timerSecondsLeft();
+  if (left < 0) return "Es läuft gerade kein Timer.";
+  if (left == 0) return "Der Timer ist gerade abgelaufen.";
+
+  long minutes = left / 60;
+  long seconds = left % 60;
+
+  if (minutes == 0) return "Noch " + String(seconds) + " Sekunden.";
+  if (seconds == 0) {
+    return "Noch " + String(minutes) + (minutes == 1 ? " Minute." : " Minuten.");
+  }
+  return "Noch " + String(minutes) + (minutes == 1 ? " Minute und " : " Minuten und ") +
+         String(seconds) + " Sekunden.";
+}
+
+static void timerFire() {
+  timerClear("abgelaufen");
+  logPrintf("Timer abgelaufen");
+
+  if (cfg.timerSound.length() > 0) playSoundFile(cfg.timerSound);
+  else playAnnouncement("Der Timer ist abgelaufen.");
+}
+
+// Called from the loop. Both are checked at minute resolution for the alarm and
+// at second resolution for the timer, which is as precise as either needs.
+void alarmTimerTick() {
+  if (wakeBusy || ttsPlaybackActive || speakerTestActive || updateInProgress) return;
+
+  if (timerEndsAt != 0 && time(nullptr) >= timerEndsAt) {
+    timerFire();
+    return;
+  }
+
+  if (cfg.alarmMinutes < 0 || !timeValid) return;
+
+  int now = localMinutesNow();
+  int day = localDayNow();
+  if (now < 0 || day < 0) return;
+
+  if (now == cfg.alarmMinutes && day != alarmFiredDay) alarmFire();
+}
+
+// --------------------------------------------------------- the voice commands
+
+static bool alarmTimerVoiceCommand(const String &lower) {
+  String norm = radioNormalize(lower);
+  if (norm.length() == 0) return false;
+
+  bool mentionsAlarm = norm.indexOf("wecker") >= 0;
+  bool mentionsTimer = norm.indexOf("timer") >= 0;
+
+  // A question about the running timer, in the forms people actually use.
+  if (timerEndsAt != 0 &&
+      (norm.indexOf("wie lange") >= 0 || norm.indexOf("wie viel zeit") >= 0 ||
+       (mentionsTimer && (norm.indexOf("noch") >= 0 || norm.indexOf("rest") >= 0 ||
+                          norm.indexOf("status") >= 0)))) {
+    wakeAnnounceText = timerSpokenRemaining();
+    wakeLastMessage = wakeAnnounceText;
+    return true;
+  }
+
+  if (!mentionsAlarm && !mentionsTimer) return false;
+
+  bool cancels = norm.indexOf("loesch") >= 0 || norm.indexOf("aus") >= 0 ||
+                 norm.indexOf("abbrech") >= 0 || norm.indexOf("stopp") >= 0 ||
+                 norm.indexOf("stop") >= 0 || norm.indexOf("entfern") >= 0;
+
+  if (mentionsTimer && cancels) {
+    timerClear("Sprachbefehl");
+    wakeAnnounceText = "Timer gelöscht.";
+    wakeLastMessage = wakeAnnounceText;
+    return true;
+  }
+
+  if (mentionsAlarm && cancels) {
+    alarmClear("Sprachbefehl");
+    wakeAnnounceText = "Wecker gelöscht.";
+    wakeLastMessage = wakeAnnounceText;
+    return true;
+  }
+
+  // "wann klingelt der wecker"
+  if (mentionsAlarm && (norm.indexOf("wann") >= 0 || norm.indexOf("steht") >= 0 ||
+                        norm.indexOf("status") >= 0)) {
+    if (cfg.alarmMinutes < 0) wakeAnnounceText = "Es ist kein Wecker gestellt.";
+    else wakeAnnounceText = "Der Wecker klingelt um " + clockText(cfg.alarmMinutes) + " Uhr.";
+    wakeLastMessage = wakeAnnounceText;
+    return true;
+  }
+
+  if (mentionsTimer) {
+    int begin = 0;
+    int end = 0;
+    int value = spokenNumberAt(norm, 0, &begin, &end);
+    if (value <= 0) return false;
+
+    // The unit decides the scale; minutes are the default because that is what
+    // people say without thinking about it.
+    uint32_t seconds = (uint32_t)value * 60;
+    String tail = norm.substring(end);
+    if (tail.indexOf("sekund") >= 0) seconds = (uint32_t)value;
+    else if (tail.indexOf("stund") >= 0) seconds = (uint32_t)value * 3600;
+
+    if (seconds < 5 || seconds > 12UL * 3600UL) return false;
+
+    timerSet(seconds);
+    wakeAnnounceText = "Timer läuft.";
+    wakeLastMessage = "Timer auf " + String(seconds) + " Sekunden gestellt.";
+    return true;
+  }
+
+  // Everything left mentions the alarm and carries a time.
+  int minutes = parseSpokenClock(norm);
+  if (minutes < 0) return false;
+
+  alarmSet(minutes);
+  wakeAnnounceText = "Wecker gestellt auf " + clockText(minutes) + " Uhr.";
+  wakeLastMessage = wakeAnnounceText;
+  return true;
+}
+
+// -----------------------------------------------------------------------------
 // Sound library
 // -----------------------------------------------------------------------------
 
@@ -9185,6 +9658,91 @@ void handleUpdateInstall() {
               "meldet sich in etwa einer Minute zurueck.");
 }
 
+void handleAlarm() {
+  if (server.method() == HTTP_GET) {
+    String json = "{\"set\":" + String(cfg.alarmMinutes >= 0 ? "true" : "false");
+    json += ",\"time\":\"" + clockText(cfg.alarmMinutes) + "\"";
+    json += ",\"minutes\":" + String(cfg.alarmMinutes);
+    json += ",\"daily\":" + String(cfg.alarmDaily ? "true" : "false");
+    json += ",\"seconds_until\":" + String(alarmSecondsUntil());
+    json += ",\"sound\":\"" + jsonEscape(cfg.alarmSound) + "\"";
+    json += ",\"briefing\":\"" + jsonEscape(cfg.alarmBriefing) + "\"}";
+    server.send(200, "application/json; charset=utf-8", json);
+    return;
+  }
+
+  if (server.hasArg("clear") || server.hasArg("delete")) {
+    alarmClear("API");
+    server.send(200, "text/plain; charset=utf-8", "Wecker geloescht.");
+    return;
+  }
+
+  if (server.hasArg("daily")) {
+    cfg.alarmDaily = server.arg("daily") == "1" || server.arg("daily") == "true";
+  }
+  if (server.hasArg("sound")) cfg.alarmSound = server.arg("sound");
+  if (server.hasArg("briefing")) cfg.alarmBriefing = server.arg("briefing");
+
+  if (server.hasArg("time")) {
+    String value = server.arg("time");
+    int colon = value.indexOf(':');
+    if (colon < 1) {
+      server.send(400, "text/plain; charset=utf-8", "Zeit als HH:MM angeben.");
+      return;
+    }
+    int hh = value.substring(0, colon).toInt();
+    int mm = value.substring(colon + 1).toInt();
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+      server.send(400, "text/plain; charset=utf-8", "Ungueltige Zeit.");
+      return;
+    }
+    alarmSet(hh * 60 + mm);
+    server.send(200, "text/plain; charset=utf-8",
+                "Wecker auf " + clockText(cfg.alarmMinutes) + " gestellt.");
+    return;
+  }
+
+  saveConfig();
+  server.send(200, "text/plain; charset=utf-8", "Gespeichert.");
+}
+
+void handleTimer() {
+  if (server.method() == HTTP_GET) {
+    String json = "{\"active\":" + String(timerEndsAt != 0 ? "true" : "false");
+    json += ",\"remaining_s\":" + String(timerSecondsLeft());
+    json += ",\"total_s\":" + String(timerTotalSec);
+    json += ",\"sound\":\"" + jsonEscape(cfg.timerSound) + "\"}";
+    server.send(200, "application/json; charset=utf-8", json);
+    return;
+  }
+
+  if (server.hasArg("clear") || server.hasArg("delete")) {
+    timerClear("API");
+    server.send(200, "text/plain; charset=utf-8", "Timer geloescht.");
+    return;
+  }
+
+  if (server.hasArg("sound")) {
+    cfg.timerSound = server.arg("sound");
+    saveConfig();
+  }
+
+  if (server.hasArg("seconds") || server.hasArg("minutes")) {
+    long seconds = server.hasArg("seconds") ? server.arg("seconds").toInt()
+                                            : server.arg("minutes").toInt() * 60;
+    if (seconds < 5 || seconds > 12L * 3600L) {
+      server.send(400, "text/plain; charset=utf-8", "Zwischen 5 Sekunden und 12 Stunden.");
+      return;
+    }
+    timerSet((uint32_t)seconds);
+    server.send(200, "text/plain; charset=utf-8",
+                "Timer laeuft " + String(seconds) + " Sekunden.");
+    return;
+  }
+
+  server.send(200, "text/plain; charset=utf-8", "Gespeichert.");
+}
+
 void handleRadioList() {
   String json = "{\"active\":" + String(radioActive ? "true" : "false");
   json += ",\"station\":\"" + jsonEscape(radioStationName) + "\"";
@@ -9490,6 +10048,8 @@ void setupWebServer() {
   server.on("/api/hardware/adc-scan", HTTP_GET, handleAdcScan);
   server.on("/api/update/check", HTTP_ANY, handleUpdateCheck);
   server.on("/api/update/install", HTTP_ANY, handleUpdateInstall);
+  server.on("/api/alarm", HTTP_ANY, handleAlarm);
+  server.on("/api/timer", HTTP_ANY, handleTimer);
   server.on("/api/radio/list", HTTP_GET, handleRadioList);
   server.on("/api/radio/play", HTTP_ANY, handleRadioPlay);
   server.on("/api/radio/stop", HTTP_ANY, handleRadioStop);
@@ -9782,6 +10342,8 @@ void loop() {
                (uint32_t)(millis() - updateCheckedAt) > UPDATE_AUTO_CHECK_MS;
     if (due) updateFetchReleases();
   }
+
+  alarmTimerTick();
 
   radioTick();
 
