@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.10.0";
+static const char* FW_VERSION = "0.11.0";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -229,6 +229,10 @@ static constexpr uint32_t RADIO_STALL_TIMEOUT_MS = 15000;
 static constexpr uint32_t RADIO_RECONNECT_DELAY_MS = 3000;
 static constexpr uint8_t RADIO_MAX_RECONNECTS = 5;
 static const char *RADIO_STATION_FILE = "/radio.txt";
+
+// Named groups of Home Assistant entities, switched in one service call.
+static constexpr uint8_t GROUP_MAX = 16;
+static const char *GROUP_FILE = "/groups.txt";
 
 // A TLS session costs about 43 kB of internal RAM on this chip. Measured with
 // an https:// stream running, the web interface still answered - after 25
@@ -509,6 +513,10 @@ uint8_t radioChannels = 0;
 uint8_t radioReconnects = 0;
 bool radioUsingTls = false;
 
+String groupNames[16];
+String groupEntities[16];
+uint8_t groupCount = 0;
+
 // Alarm and timer. The alarm survives a reboot in the config, the timer does
 // not - a countdown that resumes after a restart is a surprise, not a feature.
 int alarmFiredDay = -1;
@@ -784,6 +792,8 @@ static String multiOwnId();
 static float multiWakeScore();
 static bool radioHandleVoiceCommand(const String &lower);
 static bool alarmTimerVoiceCommand(const String &lower);
+static bool groupsVoiceCommand(const String &lower);
+static void groupsLoad();
 void alarmTimerTick();
 static String clockText(int minutes);
 static long alarmSecondsUntil();
@@ -1075,6 +1085,7 @@ static bool handleLocalVoiceCommand(const String &text) {
   if (radioHandleVoiceCommand(lower)) return true;
   if (volumeStepVoiceCommand(lower)) return true;
   if (alarmTimerVoiceCommand(lower)) return true;
+  if (groupsVoiceCommand(lower)) return true;
 
   // The command has to *be* the sentence, not appear somewhere inside it.
   // Otherwise "stell die Lautstärke im Wohnzimmer auf 5" would turn this
@@ -5708,6 +5719,34 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
 </section>
 
 <section class="card full">
+<h2>GRUPPEN</h2>
+<div class="pinbox" id="groupBox" style="min-height:46px">Lade ...</div>
+
+<label>Gruppe anlegen oder ändern</label>
+<div style="display:flex;gap:8px">
+ <input id="groupName" placeholder="Obergeschoss Licht" style="flex:1">
+ <button type="button" onclick="groupSave()">Speichern</button>
+</div>
+<textarea id="groupEntities" rows="2"
+ placeholder="light.wc_og_licht_channel_1, switch.vorzimmer_og_licht"></textarea>
+
+<small class="help">
+Gesprochen: <b>„Schalte im Obergeschoss das Licht aus"</b> oder
+<b>„Erdgeschoss Rollo öffnen"</b>. Das Gerät sucht die Gruppe, deren Name im
+Satz vorkommt, und schickt <i>einen</i> Service-Aufruf an Home Assistant — ohne
+Umweg über das Sprachmodell, das dafür Sekunden bräuchte und jedes Mal eine
+andere Auswahl treffen könnte.<br>
+Erkannte Aktionen: <b>an/ein</b>, <b>aus</b>, <b>öffnen/auf/hoch</b>,
+<b>schließen/zu/runter</b>. Licht und Steckdosen in einer Gruppe zu mischen ist
+in Ordnung — geschaltet wird über <code>homeassistant.turn_on/off</code>, das
+über alle Domänen hinweg funktioniert. Rollos brauchen eine eigene Gruppe, weil
+sie eigene Dienste haben.<br>
+Entitäten mit Komma trennen. Der Gruppenname muss mindestens zur Hälfte im Satz
+vorkommen, damit gilt — sonst passiert nichts, statt das Falsche zu schalten.
+</small>
+</section>
+
+<section class="card full">
 <h2>WECKER &amp; TIMER</h2>
 <div class="pinbox" id="alarmBox" style="min-height:40px">Lade ...</div>
 
@@ -6267,6 +6306,50 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "\n"
 "function clearLog(){logBuf=[];$('logBox').textContent='';}\n"
 "\n"
+"async function refreshGroups(){\n"
+" try{\n"
+"  const j=await (await fetch('/api/groups',{cache:'no-store'})).json();\n"
+"  const box=$('groupBox');\n"
+"  box.innerHTML='';\n"
+"  const gs=j.groups||[];\n"
+"  if(!gs.length){box.textContent='Noch keine Gruppen angelegt.';return;}\n"
+"  gs.forEach(g=>{\n"
+"   const row=document.createElement('div');\n"
+"   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0';\n"
+"   const label=document.createElement('span');\n"
+"   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
+"   label.textContent=g.name+'   ('+g.entities.split(',').length+' Entitäten)';\n"
+"   label.title=g.entities;\n"
+"   const edit=document.createElement('button');\n"
+"   edit.type='button';edit.className='secondary';edit.textContent='Bearbeiten';\n"
+"   edit.onclick=()=>{$('groupName').value=g.name;$('groupEntities').value=g.entities;};\n"
+"   const del=document.createElement('button');\n"
+"   del.type='button';del.className='danger';del.textContent='Löschen';\n"
+"   del.onclick=()=>groupDelete(g.name);\n"
+"   row.appendChild(label);row.appendChild(edit);row.appendChild(del);\n"
+"   box.appendChild(row);\n"
+"  });\n"
+" }catch(e){}\n"
+"}\n"
+"\n"
+"async function groupSave(){\n"
+" const n=$('groupName').value.trim(),e=$('groupEntities').value.trim();\n"
+" if(!n||!e){toast('Name und Entitäten bitte ausfüllen.');return;}\n"
+" const p=new URLSearchParams();p.set('name',n);p.set('entities',e);\n"
+" const r=await fetch('/api/groups',{method:'POST',\n"
+"  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
+" toast(await r.text());\n"
+" $('groupName').value='';$('groupEntities').value='';refreshGroups();\n"
+"}\n"
+"\n"
+"async function groupDelete(name){\n"
+" if(!confirm(name+' löschen?'))return;\n"
+" const p=new URLSearchParams();p.set('name',name);p.set('delete','1');\n"
+" const r=await fetch('/api/groups',{method:'POST',\n"
+"  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
+" toast(await r.text());refreshGroups();\n"
+"}\n"
+"\n"
 "async function refreshAlarm(){\n"
 " try{\n"
 "  const a=await (await fetch('/api/alarm',{cache:'no-store'})).json();\n"
@@ -6568,6 +6651,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "refreshSounds();\n"
 "refreshRadio();\n"
 "refreshAlarm();\n"
+"refreshGroups();\n"
 "setInterval(refreshRadio,5000);\n"
 "setInterval(refreshAlarm,2000);\n"
 "setInterval(refreshStatus,3000);\n"
@@ -6782,6 +6866,13 @@ void handleStatus() {
   json += "\"last_boost_db\":" + String(autoVolumeLastBoost, 1) + ",";
   json += "\"age_s\":" + String(autoVolumeNoiseValid ? (millis() - autoVolumeNoiseAt) / 1000UL : 0UL);
   json += "},";
+
+  json += "\"groups\":[";
+  for (uint8_t i = 0; i < groupCount; i++) {
+    if (i > 0) json += ",";
+    json += "\"" + jsonEscape(groupNames[i]) + "\"";
+  }
+  json += "],";
 
   json += "\"alarm\":{";
   json += "\"set\":" + String(cfg.alarmMinutes >= 0 ? "true" : "false") + ",";
@@ -9185,6 +9276,208 @@ static bool alarmTimerVoiceCommand(const String &lower) {
 }
 
 // -----------------------------------------------------------------------------
+// Group control
+//
+// "Schalte im Obergeschoss das Licht aus" names a group and an action. Both are
+// resolved here and turned into one Home Assistant service call, because
+// sending it through a language model means waiting seconds for a decision that
+// is already made - and getting a different set of entities each time.
+// -----------------------------------------------------------------------------
+
+static void groupsLoad() {
+  groupCount = 0;
+
+  File f = LittleFS.open(GROUP_FILE, "r");
+  if (!f) return;
+
+  while (f.available() && groupCount < GROUP_MAX) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int tab = line.indexOf('\t');
+    if (tab <= 0) continue;
+
+    String name = line.substring(0, tab);
+    String entities = line.substring(tab + 1);
+    name.trim();
+    entities.trim();
+    if (name.length() == 0 || entities.length() == 0) continue;
+
+    groupNames[groupCount] = name;
+    groupEntities[groupCount] = entities;
+    groupCount++;
+  }
+
+  f.close();
+}
+
+// Written beside the real file and swapped in, for the same reason the station
+// list is: a failed write must not leave an empty one.
+static bool groupsSave() {
+  static const char *tempFile = "/groups.tmp";
+
+  File f = LittleFS.open(tempFile, "w");
+  if (!f) return false;
+
+  size_t written = 0;
+  for (uint8_t i = 0; i < groupCount; i++) {
+    written += f.print(groupNames[i]);
+    written += f.print('\t');
+    written += f.print(groupEntities[i]);
+    written += f.print('\n');
+  }
+  f.close();
+
+  if (groupCount > 0 && written == 0) {
+    LittleFS.remove(tempFile);
+    return false;
+  }
+
+  LittleFS.remove(GROUP_FILE);
+  return LittleFS.rename(tempFile, GROUP_FILE);
+}
+
+// One service call for the whole group. homeassistant.turn_on/off works across
+// domains, which is what makes a mixed group of lights and switches behave the
+// way the sentence implies.
+static bool groupCallService(const String &domain, const String &service,
+                             const String &entities) {
+  if (cfg.haUrl.length() == 0 || cfg.haToken.length() == 0) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  String url = normalizedHaUrl(cfg.haUrl) + "/api/services/" + domain + "/" + service;
+
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  bool ok;
+  if (url.startsWith("https://")) {
+    secureClient.setInsecure();
+    ok = http.begin(secureClient, url);
+  } else {
+    ok = http.begin(url);
+  }
+  if (!ok) return false;
+
+  http.setTimeout(8000);
+  http.setReuse(false);
+  http.addHeader("Authorization", "Bearer " + cfg.haToken);
+  http.addHeader("Content-Type", "application/json");
+
+  String body = "{\"entity_id\":[";
+  String rest = entities;
+  bool first = true;
+  while (rest.length() > 0) {
+    int comma = rest.indexOf(',');
+    String one = comma < 0 ? rest : rest.substring(0, comma);
+    rest = comma < 0 ? "" : rest.substring(comma + 1);
+    one.trim();
+    if (one.length() == 0) continue;
+    if (!first) body += ",";
+    first = false;
+    body += "\"" + jsonEscape(one) + "\"";
+  }
+  body += "]}";
+
+  int code = http.POST(body);
+  http.end();
+
+  diagLogf("GROUP", "%s.%s -> HTTP %d", domain.c_str(), service.c_str(), code);
+  return code >= 200 && code < 300;
+}
+
+// How many of the group's own words appear in the sentence. Judged as a
+// fraction, so a two-word group needs both and a longer one is not punished
+// for the filler words around it.
+static int groupMatchScore(const String &groupName, const String &spoken) {
+  String name = radioNormalize(groupName);
+  if (name.length() == 0) return 0;
+
+  uint8_t total = 0;
+  uint8_t matched = 0;
+  String rest = name;
+  while (rest.length() > 0) {
+    int space = rest.indexOf(' ');
+    String word = space < 0 ? rest : rest.substring(0, space);
+    rest = space < 0 ? "" : rest.substring(space + 1);
+    if (word.length() < 3) continue;
+
+    total++;
+    if (radioAnyWordMatches(spoken, word)) matched++;
+  }
+
+  if (total == 0 || matched == 0) return 0;
+  if (matched * 2 < total) return 0;  // half the name has to be there
+  return matched * 100 + (matched == total ? 50 : 0);
+}
+
+// Short action words have to match whole words: "aus" appears inside
+// "Aussenbeleuchtung", and switching that off when asked to switch it on would
+// be the worst kind of bug - confidently wrong.
+static bool normHasWord(const String &norm, const char *word) {
+  String padded = " " + norm + " ";
+  return padded.indexOf(" " + String(word) + " ") >= 0;
+}
+
+static bool groupsVoiceCommand(const String &lower) {
+  if (groupCount == 0) return false;
+
+  String norm = radioNormalize(lower);
+  if (norm.length() == 0) return false;
+
+  // The action first: without one this is not a group command at all, and
+  // checking it first keeps questions about a room from switching anything.
+  String domain = "homeassistant";
+  String service = "";
+
+  if (norm.indexOf("oeffn") >= 0 || norm.indexOf("aufmach") >= 0 ||
+      norm.indexOf("hochfahr") >= 0 || normHasWord(norm, "auf") ||
+      normHasWord(norm, "hoch")) {
+    domain = "cover"; service = "open_cover";
+  } else if (norm.indexOf("schliess") >= 0 || norm.indexOf("zumach") >= 0 ||
+             norm.indexOf("runterfahr") >= 0 || norm.indexOf("herunterfahr") >= 0 ||
+             normHasWord(norm, "zu") || normHasWord(norm, "runter")) {
+    domain = "cover"; service = "close_cover";
+  } else if (norm.indexOf("ausschalt") >= 0 || norm.indexOf("ausmach") >= 0 ||
+             normHasWord(norm, "aus")) {
+    service = "turn_off";
+  } else if (norm.indexOf("einschalt") >= 0 || norm.indexOf("anschalt") >= 0 ||
+             norm.indexOf("anmach") >= 0 ||
+             normHasWord(norm, "an") || normHasWord(norm, "ein")) {
+    service = "turn_on";
+  }
+
+  if (service.length() == 0) return false;
+
+  int best = -1;
+  int bestScore = 0;
+  for (uint8_t i = 0; i < groupCount; i++) {
+    int score = groupMatchScore(groupNames[i], norm);
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+
+  if (best < 0) return false;
+
+  bool ok = groupCallService(domain, service, groupEntities[best]);
+  const char *what = service == "turn_on"    ? "eingeschaltet"
+                   : service == "turn_off"   ? "ausgeschaltet"
+                   : service == "open_cover" ? "geoeffnet"
+                                             : "geschlossen";
+
+  if (ok) {
+    wakeLastMessage = groupNames[best] + " " + what + ".";
+    diagLogf("GROUP", "\"%s\" %s", groupNames[best].c_str(), what);
+  } else {
+    wakeAnnounceText = "Das hat nicht geklappt.";
+    wakeLastMessage = "Gruppe " + groupNames[best] + ": Aufruf fehlgeschlagen.";
+  }
+  return true;
+}
+
+// -----------------------------------------------------------------------------
 // Sound library
 // -----------------------------------------------------------------------------
 
@@ -9658,8 +9951,79 @@ void handleUpdateInstall() {
               "meldet sich in etwa einer Minute zurueck.");
 }
 
+void handleGroups() {
+  if (server.args() == 0) {
+    String json = "{\"groups\":[";
+    for (uint8_t i = 0; i < groupCount; i++) {
+      if (i > 0) json += ",";
+      json += "{\"name\":\"" + jsonEscape(groupNames[i]) + "\",";
+      json += "\"entities\":\"" + jsonEscape(groupEntities[i]) + "\"}";
+    }
+    json += "]}";
+    server.send(200, "application/json; charset=utf-8", json);
+    return;
+  }
+
+  String name = server.arg("name");
+  name.trim();
+  if (name.length() == 0) {
+    server.send(400, "text/plain; charset=utf-8", "name fehlt.");
+    return;
+  }
+
+  int slot = -1;
+  for (uint8_t i = 0; i < groupCount; i++) {
+    if (groupNames[i].equalsIgnoreCase(name)) { slot = i; break; }
+  }
+
+  if (server.hasArg("delete")) {
+    if (slot < 0) {
+      server.send(404, "text/plain; charset=utf-8", "Gruppe nicht gefunden.");
+      return;
+    }
+    for (uint8_t i = slot; i + 1 < groupCount; i++) {
+      groupNames[i] = groupNames[i + 1];
+      groupEntities[i] = groupEntities[i + 1];
+    }
+    groupCount--;
+    groupNames[groupCount] = "";
+    groupEntities[groupCount] = "";
+    groupsSave();
+    server.send(200, "text/plain; charset=utf-8", name + " geloescht.");
+    return;
+  }
+
+  String entities = server.arg("entities");
+  entities.trim();
+  if (entities.length() == 0) {
+    server.send(400, "text/plain; charset=utf-8", "entities fehlt.");
+    return;
+  }
+  name.replace("\t", " ");
+  entities.replace("\t", "");
+
+  if (slot < 0) {
+    if (groupCount >= GROUP_MAX) {
+      server.send(507, "text/plain; charset=utf-8",
+                  "Es passen " + String(GROUP_MAX) + " Gruppen.");
+      return;
+    }
+    slot = groupCount++;
+  }
+
+  groupNames[slot] = name;
+  groupEntities[slot] = entities;
+
+  if (!groupsSave()) {
+    server.send(500, "text/plain; charset=utf-8", "Gruppen konnten nicht gespeichert werden.");
+    return;
+  }
+  server.send(200, "text/plain; charset=utf-8", name + " gespeichert.");
+}
+
 void handleAlarm() {
-  if (server.method() == HTTP_GET) {
+  bool reading = server.args() == 0;
+  if (reading) {
     String json = "{\"set\":" + String(cfg.alarmMinutes >= 0 ? "true" : "false");
     json += ",\"time\":\"" + clockText(cfg.alarmMinutes) + "\"";
     json += ",\"minutes\":" + String(cfg.alarmMinutes);
@@ -9707,7 +10071,8 @@ void handleAlarm() {
 }
 
 void handleTimer() {
-  if (server.method() == HTTP_GET) {
+  bool reading = server.args() == 0;
+  if (reading) {
     String json = "{\"active\":" + String(timerEndsAt != 0 ? "true" : "false");
     json += ",\"remaining_s\":" + String(timerSecondsLeft());
     json += ",\"total_s\":" + String(timerTotalSec);
@@ -10048,6 +10413,7 @@ void setupWebServer() {
   server.on("/api/hardware/adc-scan", HTTP_GET, handleAdcScan);
   server.on("/api/update/check", HTTP_ANY, handleUpdateCheck);
   server.on("/api/update/install", HTTP_ANY, handleUpdateInstall);
+  server.on("/api/groups", HTTP_ANY, handleGroups);
   server.on("/api/alarm", HTTP_ANY, handleAlarm);
   server.on("/api/timer", HTTP_ANY, handleTimer);
   server.on("/api/radio/list", HTTP_GET, handleRadioList);
@@ -10203,6 +10569,9 @@ void setup() {
 
   Serial.println("BOOT: wake word");
   srBegin();
+
+  groupsLoad();
+  logPrintf("Gruppen: %u geladen", groupCount);
 
   radioLoadStations();
   logPrintf("Radio: %u Sender gespeichert", radioStationCount);
