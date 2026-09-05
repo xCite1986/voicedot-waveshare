@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.13.0";
+static const char* FW_VERSION = "0.13.1";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -5351,7 +5351,7 @@ aside{
  padding:8px 10px;border-radius:9px;cursor:pointer;background:var(--card2);
  border:1px solid var(--line);font-size:12px;color:var(--text)}
 
-main{flex:1;min-width:0;padding:22px 26px 90px;max-width:1180px}
+main{flex:1;min-width:0;padding:22px 26px 96px;max-width:1440px}
 .pagehead{display:flex;align-items:baseline;justify-content:space-between;
  gap:14px;margin:0 0 16px}
 .pagehead h2{margin:0;font-size:19px;letter-spacing:.01em}
@@ -5367,6 +5367,7 @@ main{flex:1;min-width:0;padding:22px 26px 90px;max-width:1180px}
 .card h2{margin:0 0 14px;font-size:12px;letter-spacing:.11em;color:var(--muted)}
 h3{color:var(--text)}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.row>*{min-width:0}
 .actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}
 button{
  background:var(--accent);color:#fff;border:0;border-radius:9px;
@@ -5402,17 +5403,18 @@ input[type=checkbox]{width:auto}
 .hwstate{font-size:12px;color:var(--muted);margin-top:4px}
 
 .savebar{
- position:sticky;bottom:0;margin-top:20px;padding:12px 0;
- background:linear-gradient(to top,var(--bg) 62%,transparent);
- display:flex;gap:9px;align-items:center
+ position:fixed;left:236px;right:0;bottom:0;z-index:40;
+ padding:12px 26px;background:var(--card);border-top:1px solid var(--line);
+ display:flex;gap:12px;align-items:center
 }
 .savebar .note{font-size:12px;color:var(--muted)}
+@media(max-width:860px){.savebar{left:0;padding:10px 14px}}
 
 .modal{position:fixed;inset:0;background:rgba(6,9,14,.75);display:flex;
  align-items:center;justify-content:center;padding:18px;z-index:50}
 .modal[hidden]{display:none}
 .modalCard{background:var(--card);border:1px solid var(--line);border-radius:14px;
- padding:20px;width:min(920px,100%);max-height:88vh;overflow:auto}
+ padding:20px;width:min(1180px,100%);max-height:88vh;overflow:auto}
 .modalCard h3{margin:0 0 14px;font-size:15px;letter-spacing:.04em}
 .chip{display:flex;align-items:center;gap:8px;background:var(--card2);
  border:1px solid var(--line);border-radius:9px;padding:7px 9px;margin:5px 0}
@@ -5517,7 +5519,6 @@ input[type=checkbox]{width:auto}
  <button class="secondary" onclick="reboot()">Neu starten</button>
 </div>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-voicedot">
@@ -5552,7 +5553,6 @@ auch für die Anhebung nach Umgebungslärm.
  oninput="briLabel.textContent=this.value" onchange="applyRuntime()">
 <small id="briLabel" class="help">30</small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-hass">
@@ -5619,7 +5619,6 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
 <div class="actions"><button class="secondary" onclick="testHA()">Verbindung testen</button></div>
 <small class="help" id="haResult">Noch nicht getestet.</small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-audio">
@@ -5721,7 +5720,6 @@ Sag das Wake-Word oder drücke K2 kurz, um eine Assist-Runde zu starten. K2 lang
 Der Ring zeigt blau beim Zuhören, orange beim Denken und grün bei der Antwort.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-ansage">
@@ -5759,7 +5757,6 @@ danach klingen sie wie der Assistent und brauchen kein Netz mehr. Ohne gespeiche
 spielt VoiceDot einen kurzen Zweiklang.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-wecker">
@@ -5820,7 +5817,6 @@ nächsten Morgen zu warten. Der Timer läuft nur im Arbeitsspeicher und ist nach
 einem Neustart weg; der Wecker bleibt.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-gruppen">
@@ -5851,7 +5847,6 @@ Entitäten mit Komma trennen. Der Gruppenname muss mindestens zur Hälfte im Sat
 vorkommen, damit gilt — sonst passiert nichts, statt das Falsche zu schalten.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-radio">
@@ -5884,7 +5879,6 @@ Nur MP3-Streams, kein AAC. Die Ausgabe läuft mit 16 kHz, damit das Mikrofon
 weiter auf 16 kHz bleibt und die Stichworterkennung mithören kann.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-klaenge">
@@ -5902,7 +5896,6 @@ vorangestellt abspielen mit <b>[dingdong.mp3] Es hat geläutet.</b> —
 mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-netzwerk">
@@ -5923,7 +5916,6 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 <div class="actions"><button class="secondary" onclick="scanWifi()">WLAN suchen</button></div>
 <small class="help" id="scanResult"></small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-tagnacht">
@@ -5977,7 +5969,6 @@ Sommerzeitumstellung gleich mit. Das Profil wird nur beim Wechsel gesetzt —
 eine Änderung von Hand bleibt also bis zum nächsten Umschalten bestehen.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-multi">
@@ -6000,7 +5991,6 @@ er es aufgenommen hat. Der lauteste führt das Gespräch, die anderen legen sich
 wieder schlafen. Ist kein zweites Gerät im Netz, entfällt die Wartezeit ganz.
 </small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
 <div class="page" id="page-firmware">
@@ -6033,7 +6023,6 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
 </form>
 <small class="help" id="otaResult">Arduino IDE → Sketch → Export Compiled Binary.</small>
 </section>
-<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 </main>
 
@@ -6060,6 +6049,11 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
    <button type="button" class="secondary" onclick="groupModalClose()">Abbrechen</button>
   </div>
  </div>
+</div>
+
+<div class="savebar">
+ <button onclick="saveAll()">Speichern</button>
+ <span class="note">Sichert alle Einstellungen des Geräts, nicht nur diese Seite.</span>
 </div>
 
 <div id="toast"></div>
@@ -6657,6 +6651,9 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
 " toast(await r.text());refreshGroups();\n"
 "}\n"
 "\n"
+"let alarmLoaded=false;\n"
+"let soundsLoaded=false;\n"
+"\n"
 "async function refreshAlarm(){\n"
 " try{\n"
 "  const a=await (await fetch('/api/alarm',{cache:'no-store'})).json();\n"
@@ -6682,18 +6679,27 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
 "async function fillSoundSelects(alarmSel,timerSel){\n"
 " try{\n"
 "  const j=await (await fetch('/api/sound/list',{cache:'no-store'})).json();\n"
+"  const files=j.files||[];\n"
 "  [['alarm_sound',alarmSel,'— keiner —'],['timer_sound',timerSel,'— Ansage —']]\n"
 "   .forEach(([id,sel,none])=>{\n"
 "   const el=$(id);\n"
-"   if(el.dataset.n==String((j.files||[]).length)&&el.value===sel)return;\n"
-"   el.innerHTML='';\n"
-"   const o0=document.createElement('option');o0.value='';o0.textContent=none;\n"
-"   el.appendChild(o0);\n"
-"   (j.files||[]).forEach(f=>{\n"
-"    const o=document.createElement('option');o.value=f.name;o.textContent=f.name;\n"
-"    el.appendChild(o);});\n"
-"   el.value=sel;el.dataset.n=String((j.files||[]).length);\n"
+"   // Rebuild the options only when the library itself changed.\n"
+"   if(el.dataset.n!==String(files.length)){\n"
+"    const keep=el.value;\n"
+"    el.innerHTML='';\n"
+"    const o0=document.createElement('option');o0.value='';o0.textContent=none;\n"
+"    el.appendChild(o0);\n"
+"    files.forEach(f=>{\n"
+"     const o=document.createElement('option');o.value=f.name;o.textContent=f.name;\n"
+"     el.appendChild(o);});\n"
+"    el.dataset.n=String(files.length);\n"
+"    el.value=keep;\n"
+"   }\n"
+"   // Applied once. After that the poll must not touch it, or a choice\n"
+"   // would be undone two seconds after it was made.\n"
+"   if(!soundsLoaded)el.value=sel;\n"
 "  });\n"
+"  if(files.length||alarmLoaded)soundsLoaded=true;\n"
 " }catch(e){}\n"
 "}\n"
 "\n"
@@ -6720,7 +6726,7 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
 " const r=await fetch('/api/alarm',{method:'POST',\n"
 "  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
 " toast(await r.text());\n"
-" alarmLoaded=false;\n"
+" alarmLoaded=false;soundsLoaded=false;\n"
 " const q=new URLSearchParams();q.set('sound',$('timer_sound').value);\n"
 " await fetch('/api/timer',{method:'POST',\n"
 "  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q.toString()});\n"
