@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.12.2";
+static const char* FW_VERSION = "0.12.3";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -850,6 +850,50 @@ void pumpServices() {
 // -----------------------------------------------------------------------------
 // Utility
 // -----------------------------------------------------------------------------
+
+// A websocket text frame must carry valid UTF-8; a server is required to close
+// the connection when it does not. That is exactly what happened to the first
+// briefing: a single Latin-1 "u-umlaut" byte from a careless client killed the
+// run 65 milliseconds in, with no error event to explain it.
+//
+// Rather than dropping the bad byte, it is read as Latin-1 and re-encoded -
+// which repairs the usual cause instead of mutilating the text.
+String sanitizeUtf8(const String &in) {
+  String out;
+  out.reserve(in.length() + 8);
+
+  size_t i = 0;
+  while (i < in.length()) {
+    uint8_t c = (uint8_t)in[i];
+
+    if (c < 0x80) { out += (char)c; i++; continue; }
+
+    uint8_t need = 0;
+    if ((c & 0xE0) == 0xC0) need = 1;
+    else if ((c & 0xF0) == 0xE0) need = 2;
+    else if ((c & 0xF8) == 0xF0) need = 3;
+
+    bool valid = need > 0 && (i + need) < in.length() + 0;
+    if (valid) {
+      for (uint8_t k = 1; k <= need; k++) {
+        if (((uint8_t)in[i + k] & 0xC0) != 0x80) { valid = false; break; }
+      }
+    }
+
+    if (valid) {
+      for (uint8_t k = 0; k <= need; k++) out += in[i + k];
+      i += need + 1;
+      continue;
+    }
+
+    // Not valid UTF-8, so treat the byte as Latin-1 and encode it properly.
+    out += (char)(0xC0 | (c >> 6));
+    out += (char)(0x80 | (c & 0x3F));
+    i++;
+  }
+
+  return out;
+}
 
 String jsonEscape(const String &in) {
   String out;
@@ -9307,13 +9351,21 @@ static bool alarmSpeakBriefing(const String &instruction) {
   // A briefing that asks for weather and three calendar entries takes the agent
   // a while; a minute is generous but still bounded.
   while ((uint32_t)(millis() - start) < 60000) {
-    if (!wsReadFrame(*client, msg, opcode, 60000)) break;
-    if (opcode == 0x8) break;
+    if (!wsReadFrame(*client, msg, opcode, 60000)) {
+      diagLogf("BRIEFING", "Verbindung beendet nach %lu ms - meist ungueltiges UTF-8",
+               (unsigned long)(millis() - start));
+      break;
+    }
+    if (opcode == 0x8) {
+      diagLog("BRIEFING", "Home Assistant hat die Verbindung geschlossen");
+      break;
+    }
 
-    // Logged in full while this is young: a rejection arrives as a result
-    // message, not as an event, and silently dropping it costs a whole test
-    // cycle to notice.
-    diagLogf("BRIEFING", "WS: %s", msg.substring(0, 200).c_str());
+    // The token-by-token deltas would bury everything else; the events that
+    // decide whether this worked are still logged in full.
+    if (msg.indexOf("\"intent-progress\"") < 0) {
+      diagLogf("BRIEFING", "WS: %s", msg.substring(0, 200).c_str());
+    }
 
     String type = assistEventType(msg);
     if (type == "intent-end") {
@@ -10405,7 +10457,14 @@ void handleAlarm() {
     cfg.alarmDaily = server.arg("daily") == "1" || server.arg("daily") == "true";
   }
   if (server.hasArg("sound")) cfg.alarmSound = server.arg("sound");
-  if (server.hasArg("briefing")) cfg.alarmBriefing = server.arg("briefing");
+  if (server.hasArg("briefing")) {
+    String text = server.arg("briefing");
+    String clean = sanitizeUtf8(text);
+    if (clean != text) {
+      diagLog("ALARM", "Briefing enthielt ungueltiges UTF-8, wurde repariert");
+    }
+    cfg.alarmBriefing = clean;
+  }
 
   if (server.hasArg("time")) {
     String value = server.arg("time");
