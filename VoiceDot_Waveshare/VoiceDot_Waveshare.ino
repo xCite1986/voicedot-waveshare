@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.13.1";
+static const char* FW_VERSION = "0.13.2";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -247,6 +247,12 @@ static constexpr uint32_t RADIO_TLS_MIN_HEAP = 20000;
 // handshake that cannot leave enough room is worse than useless - a failing one
 // took 60 seconds, and the web interface was starved for every one of them.
 static constexpr uint32_t RADIO_TLS_HEAP_COST = 43000;
+
+// The release list and the firmware itself both come from GitHub, so both need
+// TLS. Below this much free heap the wake word detector is shut down for the
+// duration of the transfer. Measured on the device: 49 kB free with the
+// detector running, 123 kB without it.
+static constexpr uint32_t UPDATE_TLS_MIN_HEAP = 90000;
 
 static const char *SOUND_DIR = "/snd";
 static constexpr size_t SOUND_MAX_BYTES = 512 * 1024;
@@ -2556,6 +2562,43 @@ void srApplyConfig() {
 }
 
 #endif  // VOICEDOT_WAKEWORD
+
+// -----------------------------------------------------------------------------
+// Making room for a handshake
+//
+// mbedTLS holds two 16 kB record buffers plus the handshake state, and the wake
+// word detector holds roughly 73 kB of internal RAM. Both together do not fit,
+// which is why an update could only be fetched at boot, where the detector has
+// not started yet. For the few seconds of a transfer the detector therefore
+// steps aside - the same stop and start the interface already performs when the
+// wake word is changed.
+// -----------------------------------------------------------------------------
+
+static bool netDetectorYielded = false;
+
+static bool netMakeRoom(uint32_t needed) {
+  if (ESP.getFreeHeap() >= needed) return false;
+#ifdef VOICEDOT_WAKEWORD
+  if (!srRunning) return false;
+  uint32_t before = ESP.getFreeHeap();
+  srStopEngine();
+  netDetectorYielded = true;
+  diagLogf("NET", "detector stopped for TLS, heap %lu -> %lu",
+           (unsigned long)before, (unsigned long)ESP.getFreeHeap());
+  return true;
+#else
+  return false;
+#endif
+}
+
+static void netReleaseRoom() {
+  if (!netDetectorYielded) return;
+  netDetectorYielded = false;
+#ifdef VOICEDOT_WAKEWORD
+  if (cfg.wakeWord && srAvailable) srStartEngine();
+  diagLogf("NET", "detector back, heap %lu", (unsigned long)ESP.getFreeHeap());
+#endif
+}
 
 void playSpeakerTestTone() {
   if (!audioI2sReady || !codecPlaybackReady) return;
@@ -6013,6 +6056,11 @@ Gerät — kein USB-Kabel nötig. Geschrieben wird immer in die gerade nicht
 laufende Partition; geht dabei etwas schief, bleibt die alte Version bestehen.
 Einstellungen, Klänge und Sender überleben das Update, die Wake-Word-Modelle
 liegen in einer eigenen Partition und werden nicht mit angefasst.
+<br><br>
+Waehrend der Suche und des Ladens hoert das Geraet <b>kurz nicht zu</b>: die
+Verschluesselung zu GitHub braucht denselben Arbeitsspeicher wie die
+Wake-Word-Erkennung, die deshalb so lange pausiert und danach von selbst
+zurueckkommt.
 </small>
 </section>
 <section class="card full">
@@ -8218,7 +8266,16 @@ static int updateNewestIndex() {
   return best;
 }
 
+static bool updateFetchReleasesInner();
+
 bool updateFetchReleases() {
+  bool yielded = netMakeRoom(UPDATE_TLS_MIN_HEAP);
+  bool ok = updateFetchReleasesInner();
+  if (yielded) netReleaseRoom();
+  return ok;
+}
+
+static bool updateFetchReleasesInner() {
   if (WiFi.status() != WL_CONNECTED || apMode) {
     updateStatus = "kein WLAN";
     return false;
@@ -8246,9 +8303,9 @@ bool updateFetchReleases() {
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     if (code < 0) {
-      updateStatus = "Abfrage nicht moeglich, zu wenig Speicher (groesster "
-                     "freier Block " + String(ESP.getMaxAllocHeap() / 1024) +
-                     " kB). Beim naechsten Neustart wird automatisch gesucht.";
+      updateStatus = "Abfrage fehlgeschlagen (frei " +
+                     String(ESP.getFreeHeap() / 1024) + " kB, groesster Block " +
+                     String(ESP.getMaxAllocHeap() / 1024) + " kB).";
     } else {
       updateStatus = "GitHub antwortet mit HTTP " + String(code);
     }
@@ -8383,7 +8440,16 @@ static void updateLoadResult() {
   if (message.length() > 0) updateStatus = message;
 }
 
+static void updateDownloadAndWriteInner(const String &tag, const String &url);
+
 static void updateDownloadAndWrite(const String &tag, const String &url) {
+  bool yielded = netMakeRoom(UPDATE_TLS_MIN_HEAP);
+  updateDownloadAndWriteInner(tag, url);
+  // Only reached when the update did not happen: a written one reboots.
+  if (yielded) netReleaseRoom();
+}
+
+static void updateDownloadAndWriteInner(const String &tag, const String &url) {
   // Nothing else may touch the speaker, the network or the flash from here on.
   radioStop("Firmware-Update");
   srPauseDetection();
@@ -11270,7 +11336,7 @@ void loop() {
   }
 
   if (cfg.updateCheckEnabled && !apMode && WiFi.status() == WL_CONNECTED &&
-      !wakeBusy && !ttsPlaybackActive && !updateInProgress) {
+      !wakeBusy && !ttsPlaybackActive && !updateInProgress && !radioActive) {
     bool due = updateChecked &&
                (uint32_t)(millis() - updateCheckedAt) > UPDATE_AUTO_CHECK_MS;
     if (due) updateFetchReleases();
