@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.12.3";
+static const char* FW_VERSION = "0.13.0";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -5312,107 +5312,165 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <style>
 :root{
  --bg:#0c0f14;--card:#151a22;--card2:#1b222d;--line:#2a3442;
- --text:#f4f7fb;--muted:#95a3b5;--accent:#79a6ff;
+ --text:#f4f7fb;--muted:#95a3b5;--accent:#79a6ff;--side:#10151d;
  --green:#47d885;--red:#ff6b75;--orange:#ffb454;--blue:#79a6ff
+}
+:root[data-theme="light"]{
+ --bg:#eef1f6;--card:#ffffff;--card2:#f4f6fa;--line:#d5dce6;
+ --text:#16202c;--muted:#5f6f81;--accent:#2563eb;--side:#ffffff;
+ --green:#1f9d55;--red:#d64550;--orange:#b8710c;--blue:#2563eb
 }
 *{box-sizing:border-box}
 body{
- margin:0;background:radial-gradient(circle at 50% -20%,#1b2945 0,#0c0f14 38%);
- color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif
+ margin:0;background:var(--bg);color:var(--text);
+ font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+ display:flex;min-height:100vh
 }
-.wrap{width:min(1040px,calc(100% - 28px));margin:28px auto 60px}
-header{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:18px}
-.brand{display:flex;align-items:center;gap:13px}
-.logo{
- width:48px;height:48px;border-radius:50%;
- background:conic-gradient(#76a7ff,#8d7aff,#53d7ff,#76a7ff);
- padding:4px;box-shadow:0 0 30px rgba(100,150,255,.25)
+a{color:var(--accent)}
+
+aside{
+ width:236px;flex:0 0 236px;background:var(--side);border-right:1px solid var(--line);
+ padding:18px 12px;display:flex;flex-direction:column;gap:6px;
+ position:sticky;top:0;height:100vh;overflow:auto
 }
-.logo:after{content:"";display:block;width:100%;height:100%;border-radius:50%;background:#10151d}
-h1{margin:0;font-size:25px}
-.subtitle{font-size:13px;color:var(--muted);margin-top:2px}
-.tag{border:1px solid var(--line);background:#171e28;padding:8px 11px;border-radius:999px;color:var(--muted);font-size:12px}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.brand{display:flex;align-items:center;gap:10px;padding:2px 8px 14px}
+.logo{width:26px;height:26px;border-radius:8px;flex:0 0 26px;
+ background:linear-gradient(140deg,var(--accent),#b98cff)}
+.brand h1{margin:0;font-size:15px;letter-spacing:.02em}
+.brand .sub{font-size:11px;color:var(--muted)}
+.navgroup{margin-top:12px;padding:0 8px 4px;font-size:10px;letter-spacing:.12em;
+ color:var(--muted);text-transform:uppercase}
+.navitem{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;
+ cursor:pointer;color:var(--muted);font-size:13px;border:1px solid transparent}
+.navitem:hover{background:var(--card2);color:var(--text)}
+.navitem.active{background:var(--card2);color:var(--text);border-color:var(--line)}
+.navitem i{font-style:normal;width:16px;text-align:center;opacity:.8}
+.sidefoot{margin-top:auto;padding-top:14px;border-top:1px solid var(--line);
+ display:flex;flex-direction:column;gap:8px}
+.themebtn{display:flex;align-items:center;justify-content:space-between;
+ padding:8px 10px;border-radius:9px;cursor:pointer;background:var(--card2);
+ border:1px solid var(--line);font-size:12px;color:var(--text)}
+
+main{flex:1;min-width:0;padding:22px 26px 90px;max-width:1180px}
+.pagehead{display:flex;align-items:baseline;justify-content:space-between;
+ gap:14px;margin:0 0 16px}
+.pagehead h2{margin:0;font-size:19px;letter-spacing:.01em}
+.tag{font-size:11px;color:var(--muted);border:1px solid var(--line);
+ border-radius:999px;padding:4px 11px;white-space:nowrap}
+.page{display:none}
+.page.active{display:block}
+
 .card{
- background:rgba(21,26,34,.96);border:1px solid var(--line);
- border-radius:16px;padding:18px;box-shadow:0 15px 40px rgba(0,0,0,.2)
+ background:var(--card);border:1px solid var(--line);border-radius:14px;
+ padding:18px;margin-bottom:16px
 }
-.card.full{grid-column:1/-1}
-.card h2{margin:0 0 14px;color:var(--muted);font-size:12px;letter-spacing:.14em}
-.stat{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(42,52,66,.6)}
-.stat:last-child{border:0}
-.value{text-align:right;font-weight:650}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--red);margin-right:7px}
-.dot.ok{background:var(--green);box-shadow:0 0 10px rgba(71,216,133,.4)}
-.dot.warn{background:var(--orange)}
-label{display:block;color:var(--muted);font-size:12px;margin:12px 0 6px}
-input,select{
- width:100%;background:var(--card2);border:1px solid var(--line);border-radius:10px;
- padding:11px 12px;color:var(--text);outline:none
-}
-input:focus,select:focus{border-color:var(--accent)}
-select{appearance:none;cursor:pointer}
+.card h2{margin:0 0 14px;font-size:12px;letter-spacing:.11em;color:var(--muted)}
+h3{color:var(--text)}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}
 button{
- cursor:pointer;border:0;border-radius:10px;padding:10px 14px;font-weight:700;
- background:var(--accent);color:#091224
+ background:var(--accent);color:#fff;border:0;border-radius:9px;
+ padding:9px 15px;font-size:13px;cursor:pointer
 }
-button.secondary{background:#252e3b;color:var(--text);border:1px solid var(--line)}
-button.danger{background:#3b2025;color:#ffc0c5;border:1px solid #63313a}
-button.green{background:#20412f;color:#a9f3c8;border:1px solid #376b4d}
-button.orange{background:#45351e;color:#ffd69a;border:1px solid #71562c}
+button:hover{filter:brightness(1.08)}
+button.secondary{background:var(--card2);color:var(--text);border:1px solid var(--line)}
+button.danger{background:var(--red)}
+label{display:block;margin:12px 0 5px;font-size:12px;color:var(--muted)}
+input,select,textarea{
+ width:100%;background:var(--card2);color:var(--text);
+ border:1px solid var(--line);border-radius:9px;padding:9px 11px;font:inherit
+}
+input[type=range]{padding:0}
+input[type=checkbox]{width:auto}
+.toggle{display:flex;align-items:center;gap:9px;margin-top:12px}
 .help{display:block;margin-top:8px;color:var(--muted);font-size:12px;line-height:1.5}
-.toggle{display:flex;align-items:center;gap:9px;margin-top:12px;color:var(--muted);font-size:13px}
-.toggle input{width:auto;margin:0}
-.hw{
- display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:6px
+.stat{display:flex;justify-content:space-between;gap:10px;padding:7px 0;
+ border-bottom:1px dashed var(--line);font-size:13px}
+.stat:last-child{border-bottom:0}
+.stat .value{color:var(--text);font-weight:600}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:7px}
+.dot.ok{background:var(--green)}.dot.bad{background:var(--red)}
+.dot.warn{background:var(--orange)}
+.pinbox{
+ background:var(--card2);border:1px solid var(--line);border-radius:10px;
+ padding:11px 13px;margin-top:11px;font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;
+ color:var(--muted);white-space:pre-wrap;overflow:auto
 }
-.hwitem{padding:11px;border:1px solid var(--line);background:#111720;border-radius:10px}
-.hwtitle{font-size:12px;color:var(--muted)}
-.hwstate{font-weight:750;margin-top:4px}
+.hw{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.hwitem{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:11px}
+.hwtitle{font-size:12px}
+.hwstate{font-size:12px;color:var(--muted);margin-top:4px}
+
+.savebar{
+ position:sticky;bottom:0;margin-top:20px;padding:12px 0;
+ background:linear-gradient(to top,var(--bg) 62%,transparent);
+ display:flex;gap:9px;align-items:center
+}
+.savebar .note{font-size:12px;color:var(--muted)}
+
 .modal{position:fixed;inset:0;background:rgba(6,9,14,.75);display:flex;
  align-items:center;justify-content:center;padding:18px;z-index:50}
 .modal[hidden]{display:none}
 .modalCard{background:var(--card);border:1px solid var(--line);border-radius:14px;
  padding:20px;width:min(920px,100%);max-height:88vh;overflow:auto}
 .modalCard h3{margin:0 0 14px;font-size:15px;letter-spacing:.04em}
-.chip{display:flex;align-items:center;gap:8px;background:#202735;
- border:1px solid #334052;border-radius:9px;padding:7px 9px;margin:5px 0}
+.chip{display:flex;align-items:center;gap:8px;background:var(--card2);
+ border:1px solid var(--line);border-radius:9px;padding:7px 9px;margin:5px 0}
 .chip span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
 .chip button{padding:2px 9px;margin:0;font-size:13px;line-height:1.2}
 .hit{display:flex;align-items:center;gap:8px;padding:5px 2px;cursor:pointer}
 .hit span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
-.pinbox{
- font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
- background:#0d1219;border:1px solid var(--line);border-radius:10px;padding:12px;
- line-height:1.65;font-size:12px;color:#c9d7ea;overflow:auto
-}
+
 #toast{
- position:fixed;right:18px;bottom:18px;background:#202936;border:1px solid var(--line);
- padding:12px 14px;border-radius:10px;display:none;max-width:360px;z-index:99
+ display:none;position:fixed;right:18px;bottom:18px;background:var(--card2);
+ border:1px solid var(--line);border-radius:10px;padding:11px 15px;
+ font-size:13px;z-index:60;max-width:420px
 }
-@media(max-width:720px){
- .grid{grid-template-columns:1fr}.card.full{grid-column:auto}.row{grid-template-columns:1fr}
- .hw{grid-template-columns:1fr}
+@media(max-width:860px){
+ body{flex-direction:column}
+ aside{width:auto;flex:none;height:auto;position:static;
+  flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--line)}
+ .sidefoot{margin:0;border:0;padding:0}
+ main{padding:16px 14px 80px}
+ .row,.hw{grid-template-columns:1fr}
 }
 </style>
 </head>
 <body>
-<div class="wrap">
-<header>
+<aside>
  <div class="brand">
   <div class="logo"></div>
   <div>
    <h1 id="title">VoiceDot</h1>
-   <div class="subtitle">Waveshare ESP32-S3 Audio Board</div>
+   <div class="sub">Waveshare ESP32-S3</div>
   </div>
  </div>
- <div class="tag">Firmware <span id="fw">...</span></div>
-</header>
+<div class="navitem" data-page="uebersicht" onclick="showPage('uebersicht')"><i>◧</i>Übersicht</div>
+<div class="navgroup">Sprachassistent</div>
+<div class="navitem" data-page="voicedot" onclick="showPage('voicedot')"><i>◉</i>VoiceDot</div>
+<div class="navitem" data-page="hass" onclick="showPage('hass')"><i>⌂</i>Home Assistant</div>
+<div class="navitem" data-page="audio" onclick="showPage('audio')"><i>≋</i>Audio Pipeline</div>
+<div class="navitem" data-page="ansage" onclick="showPage('ansage')"><i>☼</i>Ansage & Licht</div>
+<div class="navgroup">Funktionen</div>
+<div class="navitem" data-page="wecker" onclick="showPage('wecker')"><i>◷</i>Wecker & Timer</div>
+<div class="navitem" data-page="gruppen" onclick="showPage('gruppen')"><i>⊞</i>Gruppen</div>
+<div class="navitem" data-page="radio" onclick="showPage('radio')"><i>♪</i>Webradio</div>
+<div class="navitem" data-page="klaenge" onclick="showPage('klaenge')"><i>♫</i>Klänge</div>
+<div class="navgroup">System</div>
+<div class="navitem" data-page="netzwerk" onclick="showPage('netzwerk')"><i>⇄</i>Netzwerk</div>
+<div class="navitem" data-page="tagnacht" onclick="showPage('tagnacht')"><i>◐</i>Tag & Nacht</div>
+<div class="navitem" data-page="multi" onclick="showPage('multi')"><i>⁙</i>Mehrere VoiceDots</div>
+<div class="navitem" data-page="firmware" onclick="showPage('firmware')"><i>⤒</i>Firmware</div>
+ <div class="sidefoot">
+  <div class="themebtn" onclick="toggleTheme()">
+   <span id="themeLabel">Dunkel</span><span id="themeIcon">◐</span>
+  </div>
+ </div>
+</aside>
 
-<div class="grid">
-
+<main>
+<div class="page" id="page-uebersicht">
+<div class="pagehead"><h2>Übersicht</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card">
 <h2>SYSTEM</h2>
 <div class="stat"><span>Status</span><span class="value"><i class="dot ok"></i>Online</span></div>
@@ -5421,7 +5479,6 @@ button.orange{background:#45351e;color:#ffd69a;border:1px solid #71562c}
 <div class="stat"><span>Heap frei</span><span id="heap" class="value">...</span></div>
 <div class="stat"><span>PSRAM frei</span><span id="psram" class="value">...</span></div>
 </section>
-
 <section class="card">
 <h2>BOARD</h2>
 <div class="stat"><span>Profil</span><span id="profile" class="value">...</span></div>
@@ -5429,7 +5486,6 @@ button.orange{background:#45351e;color:#ffd69a;border:1px solid #71562c}
 <div class="stat"><span>LED GPIO</span><span id="ledpin" class="value">...</span></div>
 <div class="stat"><span>Audio</span><span id="audioPins" class="value">...</span></div>
 </section>
-
 <section class="card full">
 <h2>HARDWARE DIAGNOSE</h2>
 <div class="hw">
@@ -5445,24 +5501,27 @@ button.orange{background:#45351e;color:#ffd69a;border:1px solid #71562c}
 </div>
 <small class="help">Der Hardwaretest prüft die onboard Bausteine direkt über I²C. So sehen wir sofort, welche Board-Revision geliefert wurde.</small>
 </section>
-
-<section class="card">
-<h2>NETWORK</h2>
-<div class="stat"><span>Modus</span><span id="mode" class="value">...</span></div>
-<div class="stat"><span>SSID</span><span id="ssidNow" class="value">...</span></div>
-<div class="stat"><span>Signal</span><span id="rssi" class="value">...</span></div>
-<div class="stat"><span>Hostname</span><span id="hostname" class="value">...</span></div>
-
-<label>WLAN SSID</label>
-<input id="wifi_ssid" placeholder="Mein WLAN">
-
-<label>WLAN Passwort</label>
-<input id="wifi_pass" type="password" placeholder="Passwort nur eingeben wenn geändert">
-
-<div class="actions"><button class="secondary" onclick="scanWifi()">WLAN suchen</button></div>
-<small class="help" id="scanResult"></small>
+<section class="card full">
+<h2>SERIAL LOG</h2>
+<div class="pinbox" id="logBox" style="height:280px;white-space:pre-wrap">Warte auf Logzeilen ...</div>
+<div class="actions">
+ <button class="secondary" onclick="clearLog()">Ansicht leeren</button>
+ <label class="toggle" style="margin:0"><input id="logFollow" type="checkbox" checked> automatisch scrollen</label>
+</div>
+<small class="help">Dieselben Zeilen, die über USB auf der seriellen Konsole erscheinen. Das Board hält die letzten 200.</small>
 </section>
+<section class="card full">
+<h2>KONFIGURATION</h2>
+<div class="actions">
+ <button onclick="saveConfig()">Speichern & neu starten</button>
+ <button class="secondary" onclick="reboot()">Neu starten</button>
+</div>
+</section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
 
+<div class="page" id="page-voicedot">
+<div class="pagehead"><h2>VoiceDot</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card">
 <h2>VOICE DOT</h2>
 <label>Gerätename</label>
@@ -5493,7 +5552,11 @@ auch für die Anhebung nach Umgebungslärm.
  oninput="briLabel.textContent=this.value" onchange="applyRuntime()">
 <small id="briLabel" class="help">30</small>
 </section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
 
+<div class="page" id="page-hass">
+<div class="pagehead"><h2>Home Assistant</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card full">
 <h2>HOME ASSISTANT</h2>
 <div class="row">
@@ -5556,7 +5619,11 @@ Der aktuelle Rauschboden steht in der Assist-Diagnose.
 <div class="actions"><button class="secondary" onclick="testHA()">Verbindung testen</button></div>
 <small class="help" id="haResult">Noch nicht getestet.</small>
 </section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
 
+<div class="page" id="page-audio">
+<div class="pagehead"><h2>Audio Pipeline</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card full">
 <h2>AUDIO PIPELINE</h2>
 <div class="row">
@@ -5654,57 +5721,11 @@ Sag das Wake-Word oder drücke K2 kurz, um eine Assist-Runde zu starten. K2 lang
 Der Ring zeigt blau beim Zuhören, orange beim Denken und grün bei der Antwort.
 </small>
 </section>
-
-<section class="card full">
-<h2>TAG &amp; NACHT</h2>
-<div class="toggle">
- <input id="schedule_enabled" type="checkbox">
- <label for="schedule_enabled" style="margin:0">Lautstärke und Helligkeit nach Uhrzeit umschalten</label>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
-<div class="row">
- <div>
-  <label>Tag ab</label>
-  <input id="day_start" type="time" value="06:00">
-  <label>Lautstärke Tag (0–10)</label>
-  <input id="day_volume" type="range" min="0" max="10" step="1" value="8"
-   oninput="dayVolLabel.textContent=this.value">
-  <small id="dayVolLabel" class="help">8</small>
-  <label>LED-Helligkeit Tag</label>
-  <input id="day_brightness" type="range" min="0" max="100" step="5" value="80"
-   oninput="dayBriLabel.textContent=this.value+' %'">
-  <small id="dayBriLabel" class="help">80 %</small>
- </div>
- <div>
-  <label>Nacht ab</label>
-  <input id="night_start" type="time" value="19:00">
-  <label>Lautstärke Nacht (0–10)</label>
-  <input id="night_volume" type="range" min="0" max="10" step="1" value="3"
-   oninput="nightVolLabel.textContent=this.value">
-  <small id="nightVolLabel" class="help">3</small>
-  <label>LED-Helligkeit Nacht</label>
-  <input id="night_brightness" type="range" min="0" max="100" step="5" value="30"
-   oninput="nightBriLabel.textContent=this.value+' %'">
-  <small id="nightBriLabel" class="help">30 %</small>
- </div>
-</div>
-
-<label>Zeitzone</label>
-<input id="timezone" placeholder="CET-1CEST,M3.5.0,M10.5.0/3">
-<small class="help" id="schedBox">Uhrzeit ...</small>
-
-<div class="toggle">
- <input id="ha_publish" type="checkbox">
- <label for="ha_publish" style="margin:0">Zustand an Home Assistant melden (eigene Entität)</label>
-</div>
-<small class="help" id="haStateBox">-</small>
-<small class="help">
-Die Uhrzeit kommt per NTP, die Zeitzone im POSIX-Format bringt die
-Sommerzeitumstellung gleich mit. Das Profil wird nur beim Wechsel gesetzt —
-eine Änderung von Hand bleibt also bis zum nächsten Umschalten bestehen.
-</small>
-</section>
-
+<div class="page" id="page-ansage">
+<div class="pagehead"><h2>Ansage & Licht</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card full">
 <h2>ANSAGE &amp; LICHT</h2>
 <div class="toggle">
@@ -5738,99 +5759,11 @@ danach klingen sie wie der Assistent und brauchen kein Netz mehr. Ohne gespeiche
 spielt VoiceDot einen kurzen Zweiklang.
 </small>
 </section>
-
-<section class="card full">
-<h2>MEHRERE VOICEDOTS</h2>
-<div class="toggle">
- <input id="multi_enabled" type="checkbox" checked>
- <label for="multi_enabled" style="margin:0">Bei mehreren Geräten aushandeln, wer antwortet</label>
-</div>
-<label>Wartezeit für Gegenangebote</label>
-<input id="multi_window_ms" type="range" min="80" max="600" step="20" value="220"
- oninput="multiLabel.textContent=this.value+' ms'">
-<small id="multiLabel" class="help">220 ms</small>
-<div class="pinbox" id="multiBox" style="min-height:46px">...</div>
-<button class="green" onclick="yieldPreview()">Schlafenlegen zeigen</button>
-<small class="help">
-Hören mehrere VoiceDots dasselbe Stichwort, meldet jeder per UDP-Rundruf, wie laut
-er es aufgenommen hat. Der lauteste führt das Gespräch, die anderen legen sich
-wieder schlafen. Ist kein zweites Gerät im Netz, entfällt die Wartezeit ganz.
-</small>
-</section>
-
-<section class="card full">
-<h2>FIRMWARE</h2>
-<div class="pinbox" id="updBox" style="min-height:46px">Lade ...</div>
-<div class="actions">
- <button class="secondary" onclick="updCheck()">Nach Updates suchen</button>
-</div>
-<div class="pinbox" id="updList" style="min-height:26px">-</div>
-<div class="toggle">
- <input id="update_check" type="checkbox" checked>
- <label for="update_check" style="margin:0">Selbst bei GitHub nachsehen (alle 12 Stunden)</label>
-</div>
-<small class="help">
-Die Firmware kommt aus den <b>Releases</b> des Projekts auf GitHub. Ausgewählt
-wird hier oder in Home Assistant, geladen und geschrieben wird direkt vom
-Gerät — kein USB-Kabel nötig. Geschrieben wird immer in die gerade nicht
-laufende Partition; geht dabei etwas schief, bleibt die alte Version bestehen.
-Einstellungen, Klänge und Sender überleben das Update, die Wake-Word-Modelle
-liegen in einer eigenen Partition und werden nicht mit angefasst.
-</small>
-</section>
-
-<section class="card full">
-<h2>GRUPPEN</h2>
-<div class="pinbox" id="groupBox" style="min-height:46px">Lade ...</div>
-
-<label>Neue Gruppe anlegen</label>
-<div style="display:flex;gap:8px">
- <input id="groupName" placeholder="Obergeschoss Licht" style="flex:1"
-  onkeydown="if(event.key==='Enter'){event.preventDefault();groupCreate();}">
- <button type="button" onclick="groupCreate()">Anlegen</button>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
 
-<small class="help">
-Gesprochen: <b>„Schalte im Obergeschoss das Licht aus"</b> oder
-<b>„Erdgeschoss Rollo öffnen"</b>. Das Gerät sucht die Gruppe, deren Name im
-Satz vorkommt, und schickt <i>einen</i> Service-Aufruf an Home Assistant — ohne
-Umweg über das Sprachmodell, das dafür Sekunden bräuchte und jedes Mal eine
-andere Auswahl treffen könnte.<br>
-Erkannte Aktionen: <b>an/ein</b>, <b>aus</b>, <b>öffnen/auf/hoch</b>,
-<b>schließen/zu/runter</b>. Licht und Steckdosen in einer Gruppe zu mischen ist
-in Ordnung — geschaltet wird über <code>homeassistant.turn_on/off</code>, das
-über alle Domänen hinweg funktioniert. Rollos brauchen eine eigene Gruppe, weil
-sie eigene Dienste haben.<br>
-Entitäten mit Komma trennen. Der Gruppenname muss mindestens zur Hälfte im Satz
-vorkommen, damit gilt — sonst passiert nichts, statt das Falsche zu schalten.
-</small>
-</section>
-
-<div id="groupModal" class="modal" hidden>
- <div class="modalCard">
-  <h3 id="groupModalTitle">Gruppe bearbeiten</h3>
-  <div class="row">
-   <div>
-    <label>Entität in Home Assistant suchen</label>
-    <div style="display:flex;gap:8px">
-     <input id="entQuery" placeholder="licht og" style="flex:1"
-      onkeydown="if(event.key==='Enter'){event.preventDefault();entSearch();}">
-     <button type="button" class="secondary" onclick="entSearch()">Suchen</button>
-    </div>
-    <div class="pinbox" id="entHits" style="min-height:180px">Suchbegriff eingeben.</div>
-   </div>
-   <div>
-    <label>In dieser Gruppe</label>
-    <div class="pinbox" id="entChosen" style="min-height:180px">Noch nichts ausgewählt.</div>
-   </div>
-  </div>
-  <div class="actions">
-   <button type="button" onclick="groupModalSave()">Speichern</button>
-   <button type="button" class="secondary" onclick="groupModalClose()">Abbrechen</button>
-  </div>
- </div>
-</div>
-
+<div class="page" id="page-wecker">
+<div class="pagehead"><h2>Wecker & Timer</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card full">
 <h2>WECKER &amp; TIMER</h2>
 <div class="pinbox" id="alarmBox" style="min-height:40px">Lade ...</div>
@@ -5887,7 +5820,42 @@ nächsten Morgen zu warten. Der Timer läuft nur im Arbeitsspeicher und ist nach
 einem Neustart weg; der Wecker bleibt.
 </small>
 </section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
 
+<div class="page" id="page-gruppen">
+<div class="pagehead"><h2>Gruppen</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
+<section class="card full">
+<h2>GRUPPEN</h2>
+<div class="pinbox" id="groupBox" style="min-height:46px">Lade ...</div>
+
+<label>Neue Gruppe anlegen</label>
+<div style="display:flex;gap:8px">
+ <input id="groupName" placeholder="Obergeschoss Licht" style="flex:1"
+  onkeydown="if(event.key==='Enter'){event.preventDefault();groupCreate();}">
+ <button type="button" onclick="groupCreate()">Anlegen</button>
+</div>
+
+<small class="help">
+Gesprochen: <b>„Schalte im Obergeschoss das Licht aus"</b> oder
+<b>„Erdgeschoss Rollo öffnen"</b>. Das Gerät sucht die Gruppe, deren Name im
+Satz vorkommt, und schickt <i>einen</i> Service-Aufruf an Home Assistant — ohne
+Umweg über das Sprachmodell, das dafür Sekunden bräuchte und jedes Mal eine
+andere Auswahl treffen könnte.<br>
+Erkannte Aktionen: <b>an/ein</b>, <b>aus</b>, <b>öffnen/auf/hoch</b>,
+<b>schließen/zu/runter</b>. Licht und Steckdosen in einer Gruppe zu mischen ist
+in Ordnung — geschaltet wird über <code>homeassistant.turn_on/off</code>, das
+über alle Domänen hinweg funktioniert. Rollos brauchen eine eigene Gruppe, weil
+sie eigene Dienste haben.<br>
+Entitäten mit Komma trennen. Der Gruppenname muss mindestens zur Hälfte im Satz
+vorkommen, damit gilt — sonst passiert nichts, statt das Falsche zu schalten.
+</small>
+</section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
+
+<div class="page" id="page-radio">
+<div class="pagehead"><h2>Webradio</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card full">
 <h2>WEBRADIO</h2>
 <div class="pinbox" id="radioNow" style="min-height:26px">-</div>
@@ -5916,7 +5884,11 @@ Nur MP3-Streams, kein AAC. Die Ausgabe läuft mit 16 kHz, damit das Mikrofon
 weiter auf 16 kHz bleibt und die Stichworterkennung mithören kann.
 </small>
 </section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
 
+<div class="page" id="page-klaenge">
+<div class="pagehead"><h2>Klänge</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card full">
 <h2>KLÄNGE</h2>
 <form id="soundForm">
@@ -5930,26 +5902,129 @@ vorangestellt abspielen mit <b>[dingdong.mp3] Es hat geläutet.</b> —
 mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 </small>
 </section>
-
-<section class="card full">
-<h2>SERIAL LOG</h2>
-<div class="pinbox" id="logBox" style="height:280px;white-space:pre-wrap">Warte auf Logzeilen ...</div>
-<div class="actions">
- <button class="secondary" onclick="clearLog()">Ansicht leeren</button>
- <label class="toggle" style="margin:0"><input id="logFollow" type="checkbox" checked> automatisch scrollen</label>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
-<small class="help">Dieselben Zeilen, die über USB auf der seriellen Konsole erscheinen. Das Board hält die letzten 200.</small>
-</section>
 
-<section class="card full">
-<h2>KONFIGURATION</h2>
-<div class="actions">
- <button onclick="saveConfig()">Speichern & neu starten</button>
- <button class="secondary" onclick="reboot()">Neu starten</button>
- <button class="danger" onclick="factoryReset()">Werkseinstellungen</button>
+<div class="page" id="page-netzwerk">
+<div class="pagehead"><h2>Netzwerk</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
+<section class="card">
+<h2>NETWORK</h2>
+<div class="stat"><span>Modus</span><span id="mode" class="value">...</span></div>
+<div class="stat"><span>SSID</span><span id="ssidNow" class="value">...</span></div>
+<div class="stat"><span>Signal</span><span id="rssi" class="value">...</span></div>
+<div class="stat"><span>Hostname</span><span id="hostname" class="value">...</span></div>
+
+<label>WLAN SSID</label>
+<input id="wifi_ssid" placeholder="Mein WLAN">
+
+<label>WLAN Passwort</label>
+<input id="wifi_pass" type="password" placeholder="Passwort nur eingeben wenn geändert">
+
+<div class="actions"><button class="secondary" onclick="scanWifi()">WLAN suchen</button></div>
+<small class="help" id="scanResult"></small>
+</section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
-</section>
 
+<div class="page" id="page-tagnacht">
+<div class="pagehead"><h2>Tag & Nacht</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
+<section class="card full">
+<h2>TAG &amp; NACHT</h2>
+<div class="toggle">
+ <input id="schedule_enabled" type="checkbox">
+ <label for="schedule_enabled" style="margin:0">Lautstärke und Helligkeit nach Uhrzeit umschalten</label>
+</div>
+
+<div class="row">
+ <div>
+  <label>Tag ab</label>
+  <input id="day_start" type="time" value="06:00">
+  <label>Lautstärke Tag (0–10)</label>
+  <input id="day_volume" type="range" min="0" max="10" step="1" value="8"
+   oninput="dayVolLabel.textContent=this.value">
+  <small id="dayVolLabel" class="help">8</small>
+  <label>LED-Helligkeit Tag</label>
+  <input id="day_brightness" type="range" min="0" max="100" step="5" value="80"
+   oninput="dayBriLabel.textContent=this.value+' %'">
+  <small id="dayBriLabel" class="help">80 %</small>
+ </div>
+ <div>
+  <label>Nacht ab</label>
+  <input id="night_start" type="time" value="19:00">
+  <label>Lautstärke Nacht (0–10)</label>
+  <input id="night_volume" type="range" min="0" max="10" step="1" value="3"
+   oninput="nightVolLabel.textContent=this.value">
+  <small id="nightVolLabel" class="help">3</small>
+  <label>LED-Helligkeit Nacht</label>
+  <input id="night_brightness" type="range" min="0" max="100" step="5" value="30"
+   oninput="nightBriLabel.textContent=this.value+' %'">
+  <small id="nightBriLabel" class="help">30 %</small>
+ </div>
+</div>
+
+<label>Zeitzone</label>
+<input id="timezone" placeholder="CET-1CEST,M3.5.0,M10.5.0/3">
+<small class="help" id="schedBox">Uhrzeit ...</small>
+
+<div class="toggle">
+ <input id="ha_publish" type="checkbox">
+ <label for="ha_publish" style="margin:0">Zustand an Home Assistant melden (eigene Entität)</label>
+</div>
+<small class="help" id="haStateBox">-</small>
+<small class="help">
+Die Uhrzeit kommt per NTP, die Zeitzone im POSIX-Format bringt die
+Sommerzeitumstellung gleich mit. Das Profil wird nur beim Wechsel gesetzt —
+eine Änderung von Hand bleibt also bis zum nächsten Umschalten bestehen.
+</small>
+</section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
+
+<div class="page" id="page-multi">
+<div class="pagehead"><h2>Mehrere VoiceDots</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
+<section class="card full">
+<h2>MEHRERE VOICEDOTS</h2>
+<div class="toggle">
+ <input id="multi_enabled" type="checkbox" checked>
+ <label for="multi_enabled" style="margin:0">Bei mehreren Geräten aushandeln, wer antwortet</label>
+</div>
+<label>Wartezeit für Gegenangebote</label>
+<input id="multi_window_ms" type="range" min="80" max="600" step="20" value="220"
+ oninput="multiLabel.textContent=this.value+' ms'">
+<small id="multiLabel" class="help">220 ms</small>
+<div class="pinbox" id="multiBox" style="min-height:46px">...</div>
+<button class="green" onclick="yieldPreview()">Schlafenlegen zeigen</button>
+<small class="help">
+Hören mehrere VoiceDots dasselbe Stichwort, meldet jeder per UDP-Rundruf, wie laut
+er es aufgenommen hat. Der lauteste führt das Gespräch, die anderen legen sich
+wieder schlafen. Ist kein zweites Gerät im Netz, entfällt die Wartezeit ganz.
+</small>
+</section>
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
+</div>
+
+<div class="page" id="page-firmware">
+<div class="pagehead"><h2>Firmware</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
+<section class="card full">
+<h2>FIRMWARE</h2>
+<div class="pinbox" id="updBox" style="min-height:46px">Lade ...</div>
+<div class="actions">
+ <button class="secondary" onclick="updCheck()">Nach Updates suchen</button>
+</div>
+<div class="pinbox" id="updList" style="min-height:26px">-</div>
+<div class="toggle">
+ <input id="update_check" type="checkbox" checked>
+ <label for="update_check" style="margin:0">Selbst bei GitHub nachsehen (alle 12 Stunden)</label>
+</div>
+<small class="help">
+Die Firmware kommt aus den <b>Releases</b> des Projekts auf GitHub. Ausgewählt
+wird hier oder in Home Assistant, geladen und geschrieben wird direkt vom
+Gerät — kein USB-Kabel nötig. Geschrieben wird immer in die gerade nicht
+laufende Partition; geht dabei etwas schief, bleibt die alte Version bestehen.
+Einstellungen, Klänge und Sender überleben das Update, die Wake-Word-Modelle
+liegen in einer eigenen Partition und werden nicht mit angefasst.
+</small>
+</section>
 <section class="card full">
 <h2>FIRMWARE UPDATE</h2>
 <form id="otaForm">
@@ -5958,8 +6033,33 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 </form>
 <small class="help" id="otaResult">Arduino IDE → Sketch → Export Compiled Binary.</small>
 </section>
-
+<div class="savebar"><button onclick="saveAll()">Speichern</button><span class="note">Speichert alle Einstellungen des Geräts.</span></div>
 </div>
+</main>
+
+<div id="groupModal" class="modal" hidden>
+ <div class="modalCard">
+  <h3 id="groupModalTitle">Gruppe bearbeiten</h3>
+  <div class="row">
+   <div>
+    <label>Entität in Home Assistant suchen</label>
+    <div style="display:flex;gap:8px">
+     <input id="entQuery" placeholder="licht og" style="flex:1"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();entSearch();}">
+     <button type="button" class="secondary" onclick="entSearch()">Suchen</button>
+    </div>
+    <div class="pinbox" id="entHits" style="min-height:180px">Suchbegriff eingeben.</div>
+   </div>
+   <div>
+    <label>In dieser Gruppe</label>
+    <div class="pinbox" id="entChosen" style="min-height:180px">Noch nichts ausgewählt.</div>
+   </div>
+  </div>
+  <div class="actions">
+   <button type="button" onclick="groupModalSave()">Speichern</button>
+   <button type="button" class="secondary" onclick="groupModalClose()">Abbrechen</button>
+  </div>
+ </div>
 </div>
 
 <div id="toast"></div>
@@ -5968,6 +6068,39 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 )HTML"
 "\n"
 "const $=id=>document.getElementById(id);\n"
+"\n"
+"// The chosen page and theme are remembered per browser, so a reload does\n"
+"// not drop you back on the overview in the middle of setting something up.\n"
+"function showPage(key){\n"
+" document.querySelectorAll('.page').forEach(p=>\n"
+"  p.classList.toggle('active',p.id==='page-'+key));\n"
+" document.querySelectorAll('.navitem').forEach(n=>\n"
+"  n.classList.toggle('active',n.dataset.page===key));\n"
+" try{localStorage.setItem('vd_page',key);}catch(e){}\n"
+" window.scrollTo(0,0);\n"
+"}\n"
+"\n"
+"function applyTheme(t){\n"
+" document.documentElement.setAttribute('data-theme',t);\n"
+" const dark=t!=='light';\n"
+" $('themeLabel').textContent=dark?'Dunkel':'Hell';\n"
+" $('themeIcon').textContent=dark?'◐':'☀';\n"
+" try{localStorage.setItem('vd_theme',t);}catch(e){}\n"
+"}\n"
+"\n"
+"function toggleTheme(){\n"
+" const now=document.documentElement.getAttribute('data-theme');\n"
+" applyTheme(now==='light'?'dark':'light');\n"
+"}\n"
+"\n"
+"// One button on every page saves the whole configuration: the settings are\n"
+"// one form spread over several pages, and saving only what is visible would\n"
+"// quietly drop the rest.\n"
+"async function saveAll(){\n"
+" await applyRuntime();\n"
+" await saveConfig();\n"
+"}\n"
+"\n"
 "\n"
 "function toast(m){\n"
 " const t=$('toast');t.textContent=m;t.style.display='block';\n"
@@ -5996,7 +6129,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "  const r=await fetch('/api/status',{cache:'no-store'});\n"
 "  const j=await r.json();\n"
 "\n"
-"  $('fw').textContent=j.firmware;\n"
+"  document.querySelectorAll('.fwtag').forEach(e=>e.textContent=j.firmware);\n"
 "  $('uptime').textContent=uptime(j.uptime);\n"
 "  $('ip').textContent=j.ip;\n"
 "  $('heap').textContent=bytes(j.free_heap)+' (min '+bytes(j.min_free_heap)+')';\n"
@@ -6788,11 +6921,6 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " toast('Neustart ...');\n"
 "}\n"
 "\n"
-"async function factoryReset(){\n"
-" if(!confirm('Alle Einstellungen wirklich löschen?'))return;\n"
-" await fetch('/api/system/factory-reset',{method:'POST'});\n"
-" toast('Werkseinstellungen werden geladen ...');\n"
-"}\n"
 "\n"
 "$('soundForm').addEventListener('submit',async e=>{\n"
 " e.preventDefault();\n"
@@ -6824,6 +6952,15 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "  $('otaResult').textContent=await r.text();\n"
 " }catch(e){$('otaResult').textContent='Upload fehlgeschlagen.'}\n"
 "});\n"
+"\n"
+"(function(){\n"
+" let t='dark',pg='uebersicht';\n"
+" try{t=localStorage.getItem('vd_theme')||'dark';\n"
+"     pg=localStorage.getItem('vd_page')||'uebersicht';}catch(e){}\n"
+" applyTheme(t);\n"
+" if(!document.getElementById('page-'+pg))pg='uebersicht';\n"
+" showPage(pg);\n"
+"})();\n"
 "\n"
 "loadConfig();\n"
 "refreshStatus();\n"
