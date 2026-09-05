@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.11.1";
+static const char* FW_VERSION = "0.12.0";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -528,6 +528,10 @@ uint32_t timerTotalSec = 0;
 // A locally handled command can have something to say. Spoken instead of the
 // acknowledgement chime, so "noch zwei Minuten" reaches the room.
 String wakeAnnounceText = "";
+
+// Set by the web interface, run from the loop: the agent needs up to a minute
+// and no request handler should sit there that long.
+String briefingTestRequest = "";
 
 // A "spiele ..." we could not resolve turns into a question of our own.
 bool radioAskPending = false;
@@ -5323,6 +5327,17 @@ button.orange{background:#45351e;color:#ffd69a;border:1px solid #71562c}
 .hwitem{padding:11px;border:1px solid var(--line);background:#111720;border-radius:10px}
 .hwtitle{font-size:12px;color:var(--muted)}
 .hwstate{font-weight:750;margin-top:4px}
+.modal{position:fixed;inset:0;background:rgba(6,9,14,.75);display:flex;
+ align-items:center;justify-content:center;padding:18px;z-index:50}
+.modalCard{background:var(--card);border:1px solid var(--line);border-radius:14px;
+ padding:20px;width:min(920px,100%);max-height:88vh;overflow:auto}
+.modalCard h3{margin:0 0 14px;font-size:15px;letter-spacing:.04em}
+.chip{display:flex;align-items:center;gap:8px;background:#202735;
+ border:1px solid #334052;border-radius:9px;padding:7px 9px;margin:5px 0}
+.chip span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.chip button{padding:2px 9px;margin:0;font-size:13px;line-height:1.2}
+.hit{display:flex;align-items:center;gap:8px;padding:5px 2px;cursor:pointer}
+.hit span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
 .pinbox{
  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
  background:#0d1219;border:1px solid var(--line);border-radius:10px;padding:12px;
@@ -5723,21 +5738,12 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
 <h2>GRUPPEN</h2>
 <div class="pinbox" id="groupBox" style="min-height:46px">Lade ...</div>
 
-<label>Gruppe anlegen oder ändern</label>
+<label>Neue Gruppe anlegen</label>
 <div style="display:flex;gap:8px">
- <input id="groupName" placeholder="Obergeschoss Licht" style="flex:1">
- <button type="button" onclick="groupSave()">Speichern</button>
+ <input id="groupName" placeholder="Obergeschoss Licht" style="flex:1"
+  onkeydown="if(event.key==='Enter'){event.preventDefault();groupCreate();}">
+ <button type="button" onclick="groupCreate()">Anlegen</button>
 </div>
-<textarea id="groupEntities" rows="2"
- placeholder="light.wc_og_licht_channel_1, switch.vorzimmer_og_licht"></textarea>
-
-<label>Entität aus Home Assistant suchen</label>
-<div style="display:flex;gap:8px">
- <input id="entQuery" placeholder="licht og" style="flex:1"
-  onkeydown="if(event.key==='Enter'){event.preventDefault();entSearch();}">
- <button type="button" class="secondary" onclick="entSearch()">Suchen</button>
-</div>
-<div class="pinbox" id="entHits" style="min-height:26px">Suchbegriff eingeben, dann auf einen Treffer klicken.</div>
 
 <small class="help">
 Gesprochen: <b>„Schalte im Obergeschoss das Licht aus"</b> oder
@@ -5754,6 +5760,31 @@ Entitäten mit Komma trennen. Der Gruppenname muss mindestens zur Hälfte im Sat
 vorkommen, damit gilt — sonst passiert nichts, statt das Falsche zu schalten.
 </small>
 </section>
+
+<div id="groupModal" class="modal" hidden>
+ <div class="modalCard">
+  <h3 id="groupModalTitle">Gruppe bearbeiten</h3>
+  <div class="row">
+   <div>
+    <label>Entität in Home Assistant suchen</label>
+    <div style="display:flex;gap:8px">
+     <input id="entQuery" placeholder="licht og" style="flex:1"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();entSearch();}">
+     <button type="button" class="secondary" onclick="entSearch()">Suchen</button>
+    </div>
+    <div class="pinbox" id="entHits" style="min-height:180px">Suchbegriff eingeben.</div>
+   </div>
+   <div>
+    <label>In dieser Gruppe</label>
+    <div class="pinbox" id="entChosen" style="min-height:180px">Noch nichts ausgewählt.</div>
+   </div>
+  </div>
+  <div class="actions">
+   <button type="button" onclick="groupModalSave()">Speichern</button>
+   <button type="button" class="secondary" onclick="groupModalClose()">Abbrechen</button>
+  </div>
+ </div>
+</div>
 
 <section class="card full">
 <h2>WECKER &amp; TIMER</h2>
@@ -5788,10 +5819,13 @@ vorkommen, damit gilt — sonst passiert nichts, statt das Falsche zu schalten.
  </div>
 </div>
 
-<label>Morgen-Briefing</label>
-<textarea id="alarm_briefing" rows="3"
- placeholder="Guten Morgen. [dingdong.mp3] Es ist Zeit aufzustehen."></textarea>
-<div class="actions"><button class="secondary" onclick="alarmSaveOptions()">Briefing und Töne speichern</button></div>
+<label>Morgen-Briefing — Anweisung an den Assistenten</label>
+<textarea id="alarm_briefing" rows="5"
+ placeholder="Stelle den Wetterbericht von heute früh vor und was wir anziehen sollen."></textarea>
+<div class="actions">
+ <button class="secondary" onclick="alarmSaveOptions()">Briefing und Töne speichern</button>
+ <button class="secondary" onclick="briefingTest()">Jetzt ausprobieren</button>
+</div>
 
 <small class="help">
 Gesprochen: <b>„Stelle den Wecker auf 7 Uhr 30"</b>, <b>„Wecker löschen"</b>,
@@ -5799,9 +5833,13 @@ Gesprochen: <b>„Stelle den Wecker auf 7 Uhr 30"</b>, <b>„Wecker löschen"</b
 <b>„Wie lange noch"</b>, <b>„Timer abbrechen"</b>. Alles wertet das Gerät selbst
 aus, ohne Umweg über den Assistenten; der Wecker klingelt deshalb auch, wenn
 Home Assistant gerade nicht erreichbar ist.<br>
-Zuerst spielt der Weckton, danach wird das Briefing gesprochen — Klänge aus der
-Bibliothek lassen sich darin wie bei einer Ansage voranstellen. Der Timer läuft
-nur im Arbeitsspeicher und ist nach einem Neustart weg; der Wecker bleibt.
+Zuerst spielt der Weckton, danach das Briefing. Das Briefing ist <b>keine feste
+Ansage, sondern eine Anweisung an deinen Assistenten</b> — sie geht durch dieselbe
+Pipeline wie ein gesprochener Befehl, das Sprachmodell darf also Wetter, Kalender
+und Gerätezustände heranziehen. Vorgelesen wird seine Antwort.<br>
+Das kann bis zu einer Minute dauern; „Jetzt ausprobieren" testet es, ohne bis zum
+nächsten Morgen zu warten. Der Timer läuft nur im Arbeitsspeicher und ist nach
+einem Neustart weg; der Wecker bleibt.
 </small>
 </section>
 
@@ -6327,11 +6365,12 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0';\n"
 "   const label=document.createElement('span');\n"
 "   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
-"   label.textContent=g.name+'   ('+g.entities.split(',').length+' Entitäten)';\n"
+"   const n=g.entities.split(',').filter(x=>x.trim()).length;\n"
+"   label.textContent=g.name+'   ('+(n?n+' Entitäten':'noch leer')+')';\n"
 "   label.title=g.entities;\n"
 "   const edit=document.createElement('button');\n"
 "   edit.type='button';edit.className='secondary';edit.textContent='Bearbeiten';\n"
-"   edit.onclick=()=>{$('groupName').value=g.name;$('groupEntities').value=g.entities;};\n"
+"   edit.onclick=()=>groupModalOpen(g.name,g.entities);\n"
 "   const del=document.createElement('button');\n"
 "   del.type='button';del.className='danger';del.textContent='Löschen';\n"
 "   del.onclick=()=>groupDelete(g.name);\n"
@@ -6339,6 +6378,49 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   box.appendChild(row);\n"
 "  });\n"
 " }catch(e){}\n"
+"}\n"
+"\n"
+"let groupEditing='';\n"
+"let groupSel=[];\n"
+"const entNames={};\n"
+"\n"
+"function groupModalOpen(name,entities){\n"
+" groupEditing=name;\n"
+" groupSel=(entities||'').split(',').map(x=>x.trim()).filter(Boolean);\n"
+" $('groupModalTitle').textContent='Gruppe: '+name;\n"
+" $('entQuery').value='';\n"
+" $('entHits').textContent='Suchbegriff eingeben.';\n"
+" groupChips();\n"
+" $('groupModal').hidden=false;\n"
+"}\n"
+"\n"
+"function groupModalClose(){$('groupModal').hidden=true;groupEditing='';}\n"
+"\n"
+"function groupChips(){\n"
+" const box=$('entChosen');\n"
+" box.innerHTML='';\n"
+" if(!groupSel.length){box.textContent='Noch nichts ausgewählt.';return;}\n"
+" groupSel.forEach(id=>{\n"
+"  const chip=document.createElement('div');\n"
+"  chip.className='chip';\n"
+"  const label=document.createElement('span');\n"
+"  label.textContent=entNames[id]?entNames[id]+'  ·  '+id:id;\n"
+"  label.title=id;\n"
+"  const x=document.createElement('button');\n"
+"  x.type='button';x.className='danger';x.textContent='×';\n"
+"  x.title='Aus der Gruppe entfernen';\n"
+"  x.onclick=()=>{groupSel=groupSel.filter(e=>e!==id);groupChips();};\n"
+"  chip.appendChild(label);chip.appendChild(x);\n"
+"  box.appendChild(chip);\n"
+" });\n"
+"}\n"
+"\n"
+"async function groupModalSave(){\n"
+" const p=new URLSearchParams();\n"
+" p.set('name',groupEditing);p.set('entities',groupSel.join(', '));\n"
+" const r=await fetch('/api/groups',{method:'POST',\n"
+"  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
+" toast(await r.text());groupModalClose();refreshGroups();\n"
 "}\n"
 "\n"
 "async function entSearch(){\n"
@@ -6352,19 +6434,17 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "  box.innerHTML='';\n"
 "  if(!j.count){box.textContent='Nichts gefunden.';return;}\n"
 "  j.entities.forEach(e=>{\n"
+"   entNames[e.id]=e.name||'';\n"
 "   const row=document.createElement('div');\n"
-"   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0;cursor:pointer';\n"
+"   row.className='hit';\n"
 "   const label=document.createElement('span');\n"
-"   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
-"   label.textContent=(e.name||e.id)+'   '+e.id;\n"
+"   label.textContent=(e.name||e.id)+'  ·  '+e.id;\n"
+"   label.title=e.id;\n"
 "   const add=document.createElement('button');\n"
 "   add.type='button';add.className='secondary';add.textContent='+';\n"
 "   const put=()=>{\n"
-"    const t=$('groupEntities');\n"
-"    const has=t.value.split(',').map(x=>x.trim()).filter(Boolean);\n"
-"    if(has.includes(e.id)){toast(e.id+' ist schon drin.');return;}\n"
-"    has.push(e.id);t.value=has.join(', ');\n"
-"    toast(e.id+' hinzugefügt.');\n"
+"    if(groupSel.includes(e.id)){toast('Ist schon in der Gruppe.');return;}\n"
+"    groupSel.push(e.id);groupChips();\n"
 "   };\n"
 "   row.onclick=put;add.onclick=ev=>{ev.stopPropagation();put();};\n"
 "   row.appendChild(label);row.appendChild(add);\n"
@@ -6379,14 +6459,16 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " }catch(e){box.textContent='Suche fehlgeschlagen: '+e;}\n"
 "}\n"
 "\n"
-"async function groupSave(){\n"
-" const n=$('groupName').value.trim(),e=$('groupEntities').value.trim();\n"
-" if(!n||!e){toast('Name und Entitäten bitte ausfüllen.');return;}\n"
-" const p=new URLSearchParams();p.set('name',n);p.set('entities',e);\n"
+"async function groupCreate(){\n"
+" const n=$('groupName').value.trim();\n"
+" if(!n){toast('Bitte einen Namen eingeben.');return;}\n"
+" const p=new URLSearchParams();p.set('name',n);p.set('entities','');\n"
 " const r=await fetch('/api/groups',{method:'POST',\n"
 "  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
 " toast(await r.text());\n"
-" $('groupName').value='';$('groupEntities').value='';refreshGroups();\n"
+" $('groupName').value='';\n"
+" await refreshGroups();\n"
+" groupModalOpen(n,'');\n"
 "}\n"
 "\n"
 "async function groupDelete(name){\n"
@@ -6407,9 +6489,14 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   'WECKER  '+(a.set?(a.time+' Uhr'+(a.daily?' , taeglich':'')+\n"
 "     (a.seconds_until>0?'   in '+hhmm(a.seconds_until):'')):'nicht gestellt')+'\\n'+\n"
 "   'TIMER   '+(t.active?('noch '+hhmm(t.remaining_s)+'   von '+hhmm(t.total_s)):'laeuft nicht');\n"
-"  if(document.activeElement!==$('alarmTime')&&a.set)$('alarmTime').value=a.time;\n"
+"  // Fields are filled once and after a save, never on the poll: it ran every\n"
+"  // two seconds and wiped whatever was being typed the moment focus left.\n"
 "  $('alarm_daily').checked=a.daily===true;\n"
-"  if(document.activeElement!==$('alarm_briefing'))$('alarm_briefing').value=a.briefing||'';\n"
+"  if(!alarmLoaded){\n"
+"   $('alarm_briefing').value=a.briefing||'';\n"
+"   if(a.set)$('alarmTime').value=a.time;\n"
+"   alarmLoaded=true;\n"
+"  }\n"
 "  await fillSoundSelects(a.sound||'',t.sound||'');\n"
 " }catch(e){}\n"
 "}\n"
@@ -6455,6 +6542,7 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 " const r=await fetch('/api/alarm',{method:'POST',\n"
 "  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()});\n"
 " toast(await r.text());\n"
+" alarmLoaded=false;\n"
 " const q=new URLSearchParams();q.set('sound',$('timer_sound').value);\n"
 " await fetch('/api/timer',{method:'POST',\n"
 "  headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q.toString()});\n"
@@ -9169,6 +9257,94 @@ static long alarmSecondsUntil() {
   return (long)delta * 60;
 }
 
+// The briefing is an instruction for the assistant, not a sentence to read out.
+// It goes through the configured pipeline starting at the intent stage, so the
+// agent can look at the weather, the calendars and what happened overnight -
+// and the answer comes back already turned into speech by the same voice the
+// assistant otherwise uses.
+static bool alarmSpeakBriefing(const String &instruction) {
+  if (instruction.length() == 0) return false;
+
+  String host;
+  uint16_t port = 0;
+  bool secure = false;
+  if (WiFi.status() != WL_CONNECTED || cfg.haUrl.isEmpty() || cfg.haToken.isEmpty() ||
+      !parseHaUrl(cfg.haUrl, host, port, secure)) {
+    diagLog("BRIEFING", "Home Assistant nicht erreichbar");
+    return false;
+  }
+
+  WiFiClient plain;
+  WiFiClientSecure tls;
+  Client *client = nullptr;
+  if (secure) { tls.setInsecure(); client = &tls; } else { client = &plain; }
+
+  if (!wsConnectHa(*client, host, port, cfg.haToken)) {
+    client->stop();
+    diagLog("BRIEFING", "WS/Auth fehlgeschlagen");
+    return false;
+  }
+
+  String run = "{\"id\":1,\"type\":\"assist_pipeline/run\"";
+  run += ",\"start_stage\":\"intent\",\"end_stage\":\"tts\"";
+  run += ",\"input\":{\"text\":\"" + jsonEscape(instruction) + "\"}";
+  run += ",\"timeout\":60";
+  if (cfg.haPipeline.length() > 0) {
+    run += ",\"pipeline\":\"" + jsonEscape(cfg.haPipeline) + "\"";
+  }
+  run += "}";
+
+  wsSendText(*client, run);
+  diagLogf("BRIEFING", "Anweisung gesendet (%u Zeichen)", instruction.length());
+
+  String msg;
+  uint8_t opcode = 0;
+  String spoken = "";
+  String ttsUrl = "";
+  uint32_t start = millis();
+
+  // A briefing that asks for weather and three calendar entries takes the agent
+  // a while; a minute is generous but still bounded.
+  while ((uint32_t)(millis() - start) < 60000) {
+    if (!wsReadFrame(*client, msg, opcode, 60000)) break;
+    if (opcode == 0x8) break;
+
+    String type = assistEventType(msg);
+    if (type == "intent-end") {
+      String speech = jsonFindLastString(msg, "speech");
+      if (speech.length() > 0) spoken = speech;
+    } else if (type == "tts-end") {
+      String path = jsonFindString(msg, "path");
+      if (path.length() > 0) ttsUrl = path;
+      else ttsUrl = jsonFindString(msg, "url");
+    } else if (type == "error") {
+      diagLogf("BRIEFING", "Fehler von Home Assistant: %s", msg.substring(0, 160).c_str());
+      break;
+    } else if (type == "run-end") {
+      break;
+    }
+
+    ledTick();
+    pumpServices();
+  }
+
+  client->stop();
+
+  if (spoken.length() > 0) {
+    wakeAssistantText = spoken;
+    logPrintf("Briefing: %s", spoken.substring(0, 120).c_str());
+  }
+
+  if (ttsUrl.length() == 0) {
+    diagLog("BRIEFING", "keine Sprachausgabe erhalten");
+    // Better a spoken answer without the assistant's voice than silence.
+    if (spoken.length() > 0) return playAnnouncement(spoken);
+    return false;
+  }
+
+  return fetchAndPlayTtsUrl(ttsUrl);
+}
+
 static void alarmFire() {
   alarmFiredDay = localDayNow();
   if (!cfg.alarmDaily) cfg.alarmMinutes = -1;
@@ -9179,9 +9355,9 @@ static void alarmFire() {
 
   if (cfg.alarmSound.length() > 0) playSoundFile(cfg.alarmSound);
 
-  // The briefing is spoken after the sound, so the sound stays the thing that
-  // wakes you and the words are for once you are awake.
-  if (cfg.alarmBriefing.length() > 0) playAnnouncement(cfg.alarmBriefing);
+  // Spoken after the sound, so the sound stays the thing that wakes you and the
+  // words are for once you are awake.
+  if (cfg.alarmBriefing.length() > 0) alarmSpeakBriefing(cfg.alarmBriefing);
 
   alarmRinging = false;
 }
@@ -9508,6 +9684,7 @@ static bool groupsVoiceCommand(const String &lower) {
   int best = -1;
   int bestScore = 0;
   for (uint8_t i = 0; i < groupCount; i++) {
+    if (groupEntities[i].length() == 0) continue;  // created but not filled yet
     int score = groupMatchScore(groupNames[i], norm);
     if (score > bestScore) {
       bestScore = score;
@@ -10162,10 +10339,6 @@ void handleGroups() {
 
   String entities = server.arg("entities");
   entities.trim();
-  if (entities.length() == 0) {
-    server.send(400, "text/plain; charset=utf-8", "entities fehlt.");
-    return;
-  }
   name.replace("\t", " ");
   entities.replace("\t", "");
 
@@ -10186,6 +10359,20 @@ void handleGroups() {
     return;
   }
   server.send(200, "text/plain; charset=utf-8", name + " gespeichert.");
+}
+
+// Waiting until seven in the morning to find out whether the instruction works
+// is not a way to develop one.
+void handleBriefingTest() {
+  String text = server.hasArg("text") ? server.arg("text") : cfg.alarmBriefing;
+  if (text.length() == 0) {
+    server.send(400, "text/plain; charset=utf-8", "Kein Briefing hinterlegt.");
+    return;
+  }
+
+  briefingTestRequest = text;
+  server.send(200, "text/plain; charset=utf-8",
+              "Briefing wird abgefragt, das dauert einen Moment.");
 }
 
 void handleAlarm() {
@@ -10582,6 +10769,7 @@ void setupWebServer() {
   server.on("/api/update/install", HTTP_ANY, handleUpdateInstall);
   server.on("/api/ha/entities", HTTP_GET, handleHaEntities);
   server.on("/api/groups", HTTP_ANY, handleGroups);
+  server.on("/api/alarm/briefing-test", HTTP_ANY, handleBriefingTest);
   server.on("/api/alarm", HTTP_ANY, handleAlarm);
   server.on("/api/timer", HTTP_ANY, handleTimer);
   server.on("/api/radio/list", HTTP_GET, handleRadioList);
@@ -10878,6 +11066,12 @@ void loop() {
     bool due = updateChecked &&
                (uint32_t)(millis() - updateCheckedAt) > UPDATE_AUTO_CHECK_MS;
     if (due) updateFetchReleases();
+  }
+
+  if (briefingTestRequest.length() > 0 && !wakeBusy && !ttsPlaybackActive) {
+    String text = briefingTestRequest;
+    briefingTestRequest = "";
+    alarmSpeakBriefing(text);
   }
 
   alarmTimerTick();
