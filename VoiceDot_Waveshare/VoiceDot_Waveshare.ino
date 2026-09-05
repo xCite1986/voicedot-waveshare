@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.11.0";
+static const char* FW_VERSION = "0.11.1";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -232,6 +232,7 @@ static const char *RADIO_STATION_FILE = "/radio.txt";
 
 // Named groups of Home Assistant entities, switched in one service call.
 static constexpr uint8_t GROUP_MAX = 16;
+static constexpr uint16_t HA_ENTITY_LIMIT = 40;
 static const char *GROUP_FILE = "/groups.txt";
 
 // A TLS session costs about 43 kB of internal RAM on this chip. Measured with
@@ -5730,6 +5731,14 @@ liegen in einer eigenen Partition und werden nicht mit angefasst.
 <textarea id="groupEntities" rows="2"
  placeholder="light.wc_og_licht_channel_1, switch.vorzimmer_og_licht"></textarea>
 
+<label>Entität aus Home Assistant suchen</label>
+<div style="display:flex;gap:8px">
+ <input id="entQuery" placeholder="licht og" style="flex:1"
+  onkeydown="if(event.key==='Enter'){event.preventDefault();entSearch();}">
+ <button type="button" class="secondary" onclick="entSearch()">Suchen</button>
+</div>
+<div class="pinbox" id="entHits" style="min-height:26px">Suchbegriff eingeben, dann auf einen Treffer klicken.</div>
+
 <small class="help">
 Gesprochen: <b>„Schalte im Obergeschoss das Licht aus"</b> oder
 <b>„Erdgeschoss Rollo öffnen"</b>. Das Gerät sucht die Gruppe, deren Name im
@@ -6330,6 +6339,44 @@ mehrere Klänge hintereinander sind erlaubt, der Text danach ist optional.
 "   box.appendChild(row);\n"
 "  });\n"
 " }catch(e){}\n"
+"}\n"
+"\n"
+"async function entSearch(){\n"
+" const q=$('entQuery').value.trim();\n"
+" const box=$('entHits');\n"
+" box.textContent='Frage Home Assistant ...';\n"
+" try{\n"
+"  const r=await fetch('/api/ha/entities?q='+encodeURIComponent(q),{cache:'no-store'});\n"
+"  if(!r.ok){box.textContent=await r.text();return;}\n"
+"  const j=await r.json();\n"
+"  box.innerHTML='';\n"
+"  if(!j.count){box.textContent='Nichts gefunden.';return;}\n"
+"  j.entities.forEach(e=>{\n"
+"   const row=document.createElement('div');\n"
+"   row.style.cssText='display:flex;align-items:center;gap:8px;margin:3px 0;cursor:pointer';\n"
+"   const label=document.createElement('span');\n"
+"   label.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis';\n"
+"   label.textContent=(e.name||e.id)+'   '+e.id;\n"
+"   const add=document.createElement('button');\n"
+"   add.type='button';add.className='secondary';add.textContent='+';\n"
+"   const put=()=>{\n"
+"    const t=$('groupEntities');\n"
+"    const has=t.value.split(',').map(x=>x.trim()).filter(Boolean);\n"
+"    if(has.includes(e.id)){toast(e.id+' ist schon drin.');return;}\n"
+"    has.push(e.id);t.value=has.join(', ');\n"
+"    toast(e.id+' hinzugefügt.');\n"
+"   };\n"
+"   row.onclick=put;add.onclick=ev=>{ev.stopPropagation();put();};\n"
+"   row.appendChild(label);row.appendChild(add);\n"
+"   box.appendChild(row);\n"
+"  });\n"
+"  if(j.truncated){\n"
+"   const note=document.createElement('small');\n"
+"   note.className='help';\n"
+"   note.textContent='Nur die ersten '+j.count+' Treffer — Suche eingrenzen.';\n"
+"   box.appendChild(note);\n"
+"  }\n"
+" }catch(e){box.textContent='Suche fehlgeschlagen: '+e;}\n"
 "}\n"
 "\n"
 "async function groupSave(){\n"
@@ -9003,47 +9050,56 @@ static bool radioHandleVoiceCommand(const String &lower) {
 // -----------------------------------------------------------------------------
 
 // German speech-to-text writes small numbers either way, so both are accepted.
-// Returns -1 when nothing number-like is found from `start` onwards.
+// Scanned word by word rather than with a substring search: "eine Minute" has
+// to count as one, while the "ein" inside "einschalten" must not. Returns -1
+// when nothing number-like is found from `start` onwards.
+struct SpokenNumber { const char *word; int value; };
+
+static const SpokenNumber SPOKEN_NUMBERS[] = {
+  {"null", 0},
+  {"ein", 1}, {"eine", 1}, {"einen", 1}, {"einer", 1}, {"eins", 1},
+  {"zwei", 2}, {"zwo", 2},
+  {"drei", 3}, {"vier", 4}, {"fuenf", 5}, {"sechs", 6}, {"sieben", 7},
+  {"acht", 8}, {"neun", 9}, {"zehn", 10}, {"elf", 11}, {"zwoelf", 12},
+  {"dreizehn", 13}, {"vierzehn", 14}, {"fuenfzehn", 15}, {"sechzehn", 16},
+  {"siebzehn", 17}, {"achtzehn", 18}, {"neunzehn", 19}, {"zwanzig", 20},
+  {"dreissig", 30}, {"vierzig", 40}, {"fuenfzig", 50}, {"sechzig", 60},
+};
+
 static int spokenNumberAt(const String &text, int start, int *beginsAt, int *endsAt) {
-  static const char *words[] = {
-    "null", "eins", "zwei", "drei", "vier", "fuenf", "sechs", "sieben",
-    "acht", "neun", "zehn", "elf", "zwoelf", "dreizehn", "vierzehn",
-    "fuenfzehn", "sechzehn", "siebzehn", "achtzehn", "neunzehn", "zwanzig"
-  };
+  int i = start;
+  while (i < (int)text.length()) {
+    while (i < (int)text.length() && text[i] == ' ') i++;
+    int wordStart = i;
+    while (i < (int)text.length() && text[i] != ' ') i++;
+    if (i <= wordStart) break;
 
-  for (int i = start; i < (int)text.length(); i++) {
-    if (isdigit((unsigned char)text[i])) {
-      int value = 0;
-      int j = i;
-      while (j < (int)text.length() && isdigit((unsigned char)text[j])) {
-        value = value * 10 + (text[j] - '0');
-        j++;
-        if (value > 9999) break;
+    String word = text.substring(wordStart, i);
+
+    bool digits = true;
+    for (size_t k = 0; k < word.length(); k++) {
+      if (!isdigit((unsigned char)word[k])) { digits = false; break; }
+    }
+    if (digits) {
+      long value = word.toInt();
+      if (value >= 0 && value <= 9999) {
+        if (beginsAt) *beginsAt = wordStart;
+        if (endsAt) *endsAt = i;
+        return (int)value;
       }
-      if (beginsAt) *beginsAt = i;
-      if (endsAt) *endsAt = j;
-      return value;
+      continue;
+    }
+
+    for (size_t n = 0; n < sizeof(SPOKEN_NUMBERS) / sizeof(SPOKEN_NUMBERS[0]); n++) {
+      if (word == SPOKEN_NUMBERS[n].word) {
+        if (beginsAt) *beginsAt = wordStart;
+        if (endsAt) *endsAt = i;
+        return SPOKEN_NUMBERS[n].value;
+      }
     }
   }
 
-  // No digits: try the words. Longest first so "sechzehn" beats "sechs".
-  int best = -1;
-  int bestPos = -1;
-  int bestEnd = -1;
-  for (int n = 20; n >= 0; n--) {
-    int at = text.indexOf(words[n], start);
-    if (at < 0) continue;
-    if (bestPos < 0 || at < bestPos) {
-      bestPos = at;
-      best = n;
-      bestEnd = at + strlen(words[n]);
-    }
-  }
-  if (best >= 0) {
-    if (beginsAt) *beginsAt = bestPos;
-    if (endsAt) *endsAt = bestEnd;
-  }
-  return best;
+  return -1;
 }
 
 // "7:30", "7 uhr 30", "sieben uhr" - all of them end up as minutes since
@@ -9951,6 +10007,117 @@ void handleUpdateInstall() {
               "meldet sich in etwa einer Minute zurueck.");
 }
 
+// Home Assistant's state list runs to hundreds of kilobytes on a busy
+// instance, so it is scanned out of the socket and only matches are kept -
+// the same reason the release list is not buffered either.
+void handleHaEntities() {
+  String query = server.arg("q");
+  query.toLowerCase();
+  query.trim();
+
+  if (cfg.haUrl.length() == 0 || cfg.haToken.length() == 0) {
+    server.send(400, "text/plain; charset=utf-8", "Home Assistant ist nicht eingerichtet.");
+    return;
+  }
+
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  String url = normalizedHaUrl(cfg.haUrl) + "/api/states";
+  bool ok;
+  if (url.startsWith("https://")) {
+    secureClient.setInsecure();
+    ok = http.begin(secureClient, url);
+  } else {
+    ok = http.begin(url);
+  }
+  if (!ok) {
+    server.send(502, "text/plain; charset=utf-8", "Verbindung zu Home Assistant fehlgeschlagen.");
+    return;
+  }
+
+  http.useHTTP10(true);
+  http.setTimeout(12000);
+  http.setReuse(false);
+  http.addHeader("Authorization", "Bearer " + cfg.haToken);
+  http.addHeader("Accept", "application/json");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    server.send(502, "text/plain; charset=utf-8", "Home Assistant antwortet mit HTTP " + String(code));
+    return;
+  }
+
+  static const char *KEY_ID = "\"entity_id\":\"";
+  static const char *KEY_NAME = "\"friendly_name\":\"";
+
+  Client *stream = http.getStreamPtr();
+  uint8_t idPos = 0;
+  uint8_t namePos = 0;
+  uint8_t capture = 0;      // 1 = entity_id, 2 = friendly_name
+  bool escaped = false;
+  String value = "";
+  String pendingId = "";
+  uint16_t found = 0;
+  uint32_t deadline = millis() + 15000;
+
+  String json = "{\"entities\":[";
+
+  while ((http.connected() || stream->available() > 0) &&
+         (int32_t)(millis() - deadline) < 0 && found < HA_ENTITY_LIMIT) {
+    int waiting = stream->available();
+    if (waiting <= 0) { pumpServices(); delay(2); continue; }
+
+    while (waiting-- > 0 && found < HA_ENTITY_LIMIT) {
+      int raw = stream->read();
+      if (raw < 0) break;
+      char c = (char)raw;
+
+      if (capture != 0) {
+        if (escaped) { value += c; escaped = false; continue; }
+        if (c == '\\') { escaped = true; continue; }
+        if (c != '"') {
+          value += c;
+          if (value.length() > 120) { capture = 0; value = ""; }
+          continue;
+        }
+
+        if (capture == 1) {
+          pendingId = value;
+        } else if (pendingId.length() > 0) {
+          // An entity is a hit when the search text appears in either half.
+          String haystack = pendingId + " " + value;
+          haystack.toLowerCase();
+          if (query.length() == 0 || haystack.indexOf(query) >= 0) {
+            if (found > 0) json += ",";
+            json += "{\"id\":\"" + jsonEscape(pendingId) + "\",";
+            json += "\"name\":\"" + jsonEscape(value) + "\"}";
+            found++;
+          }
+          pendingId = "";
+        }
+
+        capture = 0;
+        value = "";
+        continue;
+      }
+
+      idPos = (c == KEY_ID[idPos]) ? idPos + 1 : (c == KEY_ID[0] ? 1 : 0);
+      namePos = (c == KEY_NAME[namePos]) ? namePos + 1 : (c == KEY_NAME[0] ? 1 : 0);
+
+      if (KEY_ID[idPos] == '\0') { capture = 1; idPos = 0; namePos = 0; value = ""; }
+      else if (KEY_NAME[namePos] == '\0') { capture = 2; idPos = 0; namePos = 0; value = ""; }
+    }
+
+    pumpServices();
+  }
+
+  http.end();
+  json += "],\"count\":" + String(found);
+  json += ",\"truncated\":" + String(found >= HA_ENTITY_LIMIT ? "true" : "false") + "}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
 void handleGroups() {
   if (server.args() == 0) {
     String json = "{\"groups\":[";
@@ -10413,6 +10580,7 @@ void setupWebServer() {
   server.on("/api/hardware/adc-scan", HTTP_GET, handleAdcScan);
   server.on("/api/update/check", HTTP_ANY, handleUpdateCheck);
   server.on("/api/update/install", HTTP_ANY, handleUpdateInstall);
+  server.on("/api/ha/entities", HTTP_GET, handleHaEntities);
   server.on("/api/groups", HTTP_ANY, handleGroups);
   server.on("/api/alarm", HTTP_ANY, handleAlarm);
   server.on("/api/timer", HTTP_ANY, handleTimer);
