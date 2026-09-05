@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.12.1";
+static const char* FW_VERSION = "0.12.2";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -5329,6 +5329,7 @@ button.orange{background:#45351e;color:#ffd69a;border:1px solid #71562c}
 .hwstate{font-weight:750;margin-top:4px}
 .modal{position:fixed;inset:0;background:rgba(6,9,14,.75);display:flex;
  align-items:center;justify-content:center;padding:18px;z-index:50}
+.modal[hidden]{display:none}
 .modalCard{background:var(--card);border:1px solid var(--line);border-radius:14px;
  padding:20px;width:min(920px,100%);max-height:88vh;overflow:auto}
 .modalCard h3{margin:0 0 14px;font-size:15px;letter-spacing:.04em}
