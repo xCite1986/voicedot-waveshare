@@ -96,7 +96,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.12.0";
+static const char* FW_VERSION = "0.12.1";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -9308,6 +9308,11 @@ static bool alarmSpeakBriefing(const String &instruction) {
   while ((uint32_t)(millis() - start) < 60000) {
     if (!wsReadFrame(*client, msg, opcode, 60000)) break;
     if (opcode == 0x8) break;
+
+    // Logged in full while this is young: a rejection arrives as a result
+    // message, not as an event, and silently dropping it costs a whole test
+    // cycle to notice.
+    diagLogf("BRIEFING", "WS: %s", msg.substring(0, 200).c_str());
 
     String type = assistEventType(msg);
     if (type == "intent-end") {
