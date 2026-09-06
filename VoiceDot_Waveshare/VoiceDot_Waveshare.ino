@@ -106,7 +106,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.13.3";
+static const char* FW_VERSION = "0.13.4";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -1343,6 +1343,18 @@ String deviceHostname() {
 
   while (out.endsWith("-")) out.remove(out.length() - 1);
   if (out.length() < 2) out = DEFAULT_HOSTNAME;
+
+  // As long as the device carries its factory name, the identifier is added:
+  // several unnamed dots in one network would all answer to voicedot.local and
+  // whoever booted first would win the name. Once it is given a name of its
+  // own, the host name follows that name alone.
+  if (out == DEFAULT_HOSTNAME) {
+    char id[13];
+    snprintf(id, sizeof(id), "%012llx", (unsigned long long)ESP.getEfuseMac());
+    out += '-';
+    out += id;
+  }
+
   return out;
 }
 

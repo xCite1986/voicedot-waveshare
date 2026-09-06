@@ -147,8 +147,12 @@ die Taste erst nach dem Einstecken loslassen.
    Geräten von selbst als Captive Portal hoch. Der LED-Ring leuchtet dabei
    orange.
 2. WLAN auswählen, Passwort eintragen, speichern — das Board startet neu.
-3. Danach erreichbar unter `http://<gerätename>.local`, voreingestellt
-   `http://voicedot.local`.
+3. Danach erreichbar unter `http://<gerätename>.local`. Solange das Gerät
+   seinen Werksnamen trägt, hängt die ID mit dran —
+   `http://voicedot-9c63e362f2a0.local` —, damit mehrere unbenannte Dots im
+   selben Netz nicht um `voicedot.local` streiten. Sobald du unter
+   *Konfiguration* einen eigenen Namen vergibst, richtet sich der Hostname nur
+   noch danach.
 4. Unter **Home Assistant** die URL und einen **Long-Lived Access Token**
    eintragen (in HA: Profil → Sicherheit → ganz unten) und *Verbindung testen*.
 5. *Pipelines aus HA laden* und die gewünschte Assist-Pipeline wählen.
