@@ -106,7 +106,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.13.2";
+static const char* FW_VERSION = "0.13.3";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -1347,11 +1347,14 @@ String deviceHostname() {
 }
 
 String makeApSsid() {
-  uint64_t chip = ESP.getEfuseMac();
-  uint32_t suffix = (uint32_t)(chip & 0xFFFFFF);
-
+  // The full identifier, not just the last three MAC bytes: two boards from
+  // different production runs can share those, and then both would open a
+  // setup network of the same name. Measured on two devices here, 6457e362f2a0
+  // and 9c63e362f2a0 - identical in the last three bytes. This matches the
+  // device_id the API reports, so the network can be told apart at a glance.
   char buf[32];
-  snprintf(buf, sizeof(buf), "VoiceDot-%06lX", (unsigned long)suffix);
+  snprintf(buf, sizeof(buf), "VoiceDot-%012llX",
+           (unsigned long long)ESP.getEfuseMac());
   return String(buf);
 }
 

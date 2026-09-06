@@ -140,7 +140,9 @@ die Taste erst nach dem Einstecken loslassen.
 ## 6. Erste Inbetriebnahme
 
 1. Starten. Ohne gespeichertes WLAN öffnet der VoiceDot einen
-   Setup-Accesspoint **`VoiceDot-XXXXXX`**, Passwort **`voicedot`**. Die
+   Setup-Accesspoint **`VoiceDot-<Geräte-ID>`**, Passwort **`voicedot`**. Die
+   ID ist die vollständige MAC des Boards, etwa `VoiceDot-9C63E362F2A0`, und
+   steht später auch unter `device_id` in `/api/status`. Die
    Oberfläche liegt unter `http://192.168.4.1` und kommt auf den meisten
    Geräten von selbst als Captive Portal hoch. Der LED-Ring leuchtet dabei
    orange.
