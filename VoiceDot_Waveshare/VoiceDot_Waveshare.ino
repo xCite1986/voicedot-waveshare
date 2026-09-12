@@ -106,7 +106,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.13.4";
+static const char* FW_VERSION = "0.13.6";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -7270,6 +7270,30 @@ void handleStatus() {
   }
   json += "],";
 
+  // Sound library file names, so a client can offer the alarm and timer tones
+  // as a picker without a second request. Same directory walk as handleSoundList,
+  // names only. An empty alarm/timer sound means the built-in default.
+  json += "\"sounds\":[";
+  if (ackFsReady) {
+    File dir = LittleFS.open(SOUND_DIR);
+    if (dir && dir.isDirectory()) {
+      bool first = true;
+      File entry = dir.openNextFile();
+      while (entry) {
+        if (!entry.isDirectory()) {
+          String name = entry.name();
+          int slash = name.lastIndexOf('/');
+          if (slash >= 0) name = name.substring(slash + 1);
+          if (!first) json += ",";
+          first = false;
+          json += "\"" + jsonEscape(name) + "\"";
+        }
+        entry = dir.openNextFile();
+      }
+    }
+  }
+  json += "],";
+
   json += "\"alarm\":{";
   json += "\"set\":" + String(cfg.alarmMinutes >= 0 ? "true" : "false") + ",";
   json += "\"time\":\"" + clockText(cfg.alarmMinutes) + "\",";
@@ -10164,6 +10188,34 @@ void handleVolume() {
               "Lautstärke " + String(cfg.volume) + " %");
 }
 
+// Mute for Home Assistant. on=1/0 (or {"on":..}) sets it explicitly, no
+// argument toggles. Uses the same volume-before-mute memory as the K2 long
+// press, so unmute restores the level the device had before.
+void handleMute() {
+  bool target;
+  if (server.hasArg("on")) {
+    String v = server.arg("on");
+    target = (v == "1" || v == "true");
+  } else if (server.hasArg("plain")) {
+    int on = jsonFindInt(server.arg("plain"), "on", -1);
+    target = on > 0 ? true : (on == 0 ? false : !muted);
+  } else {
+    target = !muted;  // no argument: toggle
+  }
+
+  if (target && !muted) {
+    if (cfg.volume > 0) volumeBeforeMute = cfg.volume;
+    setVolume(0);
+  } else if (!target && muted) {
+    setVolume(volumeBeforeMute > 0 ? volumeBeforeMute : 60);
+  }
+
+  haPublishAt = 0;  // report the change straight away
+  String json = "{\"muted\":" + String(muted ? "true" : "false") +
+                ",\"volume\":" + String(cfg.volume) + "}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
 // Multipart upload of one sound file.
 void handleSoundUploadData() {
   HTTPUpload &upload = server.upload();
@@ -11081,6 +11133,7 @@ void setupWebServer() {
   server.on("/api/sound/play", HTTP_ANY, handleSoundPlay);
   server.on("/api/sound/upload", HTTP_POST, handleSoundUploadDone, handleSoundUploadData);
   server.on("/api/volume", HTTP_ANY, handleVolume);
+  server.on("/api/mute", HTTP_ANY, handleMute);
   server.on("/api/ha/pipelines", HTTP_POST, handlePipelineRefresh);
   server.on("/api/ack/build", HTTP_POST, handleAckBuild);
   server.on("/api/ack/test", HTTP_POST, handleAckTest);
