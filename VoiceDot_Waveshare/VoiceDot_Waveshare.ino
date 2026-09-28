@@ -106,7 +106,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.14.3";
+static const char* FW_VERSION = "0.15.0";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -484,6 +484,13 @@ String pipelineListStatus = "noch nicht abgerufen";
 String haTtsLanguage = "";
 String haTtsVoice = "";
 
+// Device role for a multi-device setup. A satellite records but plays nothing -
+// it sends both the acknowledgement and the answer to the master, which is the
+// single point of audio output. Standalone (the default) is a normal, lone dot.
+static constexpr uint8_t ROLE_STANDALONE = 0;
+static constexpr uint8_t ROLE_SATELLITE  = 1;
+static constexpr uint8_t ROLE_MASTER     = 2;
+
 // Peers and the state of one arbitration round.
 struct VoiceDotPeer {
   String id;
@@ -492,6 +499,7 @@ struct VoiceDotPeer {
   uint32_t lastSeen = 0;
   float lastScore = -99.0f;
   bool lastWon = false;
+  uint8_t role = ROLE_STANDALONE;
 };
 
 WiFiUDP multiUdp;
@@ -616,6 +624,12 @@ size_t soundUploadBytes = 0;
 bool soundUploadFailed = false;
 
 String soundPlayRequest = "";
+
+// A master plays these on behalf of a satellite (queued from the web handler,
+// run from loop() like every other playback).
+String remotePlayUrl = "";
+bool remotePlayUrlReq = false;
+bool remoteAckReq = false;
 
 String announceText = "";
 String announceStatus = "-";
@@ -836,6 +850,7 @@ struct Config {
   bool multiEnabled;    // arbitrate the wake word with other VoiceDots
   uint16_t multiWindowMs; // how long to wait for competing claims
   bool bargeIn;         // capture continuously so one can talk over the wake word
+  uint8_t deviceRole;   // ROLE_STANDALONE / ROLE_SATELLITE / ROLE_MASTER
 };
 
 Config cfg;
@@ -856,7 +871,10 @@ static void applySchedule(bool force);
 bool playAckSound();
 bool playSoundFile(const String &name);
 static String multiOwnId();
+static String multiMasterIp();
 static float multiWakeScore();
+static void turnPlayAck();
+static bool turnPlayTts(const String &url);
 static bool radioHandleVoiceCommand(const String &lower);
 static bool alarmTimerVoiceCommand(const String &lower);
 static bool groupsVoiceCommand(const String &lower);
@@ -1476,6 +1494,7 @@ void loadConfig() {
   cfg.multiEnabled = prefs.getBool("multi_on", true);
   cfg.multiWindowMs = constrain(prefs.getUShort("multi_win", 220), 80, 600);
   cfg.bargeIn = prefs.getBool("barge_in", false);
+  cfg.deviceRole = constrain(prefs.getUChar("role", ROLE_STANDALONE), 0, 2);
   cfg.timezone = prefs.getString("tz", DEFAULT_TIMEZONE);
   if (cfg.timezone.isEmpty()) cfg.timezone = DEFAULT_TIMEZONE;
   cfg.ackPhrases = prefs.getString("ack_phrases", ACK_DEFAULT_PHRASES);
@@ -1539,6 +1558,7 @@ void saveConfig() {
   prefs.putBool("multi_on", cfg.multiEnabled);
   prefs.putUShort("multi_win", cfg.multiWindowMs);
   prefs.putBool("barge_in", cfg.bargeIn);
+  prefs.putUChar("role", cfg.deviceRole);
   prefs.putString("tz", cfg.timezone);
   prefs.putString("ack_phrases", cfg.ackPhrases);
   prefs.putString("ha_tts_eng", haTtsEngine);
@@ -4809,7 +4829,7 @@ static bool assistFinish(AssistStream &st) {
       }
     }
 
-    bool ttsOk = fetchAndPlayTtsUrl(playUrl);
+    bool ttsOk = turnPlayTts(playUrl);
     wakeLastState = ttsOk ? "done" : "partial";
     wakeLastMessage = ttsOk
                       ? "HA Assist fertig, TTS abgespielt."
@@ -4823,6 +4843,50 @@ static bool assistFinish(AssistStream &st) {
   else if (wakeTranscript.length() > 0) wakeLastMessage = "HA Assist fertig: " + wakeTranscript;
   else wakeLastMessage = "HA Assist fertig.";
   return true;
+}
+
+// Sends a short command to the master over plain HTTP. A satellite uses this to
+// hand its acknowledgement and answer to the one device that owns the speaker.
+static bool masterPost(const String &path, const String &jsonBody) {
+  String ip = multiMasterIp();
+  if (ip.isEmpty()) {
+    diagLog("ROLE", "kein Master im Netz gefunden");
+    return false;
+  }
+
+  HTTPClient http;
+  if (!http.begin("http://" + ip + path)) return false;
+  http.setConnectTimeout(1500);
+  http.setTimeout(3000);
+
+  int code;
+  if (jsonBody.length() > 0) {
+    http.addHeader("Content-Type", "application/json");
+    code = http.POST(jsonBody);
+  } else {
+    code = http.POST((uint8_t*)nullptr, 0);
+  }
+  http.end();
+
+  diagLogf("ROLE", "master %s -> %d", path.c_str(), code);
+  return code > 0 && code < 400;
+}
+
+// A satellite with a reachable master routes all audio output there.
+static bool outputIsRemote() {
+  return cfg.deviceRole == ROLE_SATELLITE && multiMasterIp().length() > 0;
+}
+
+// Play the acknowledgement - locally, or on the master for a satellite.
+static void turnPlayAck() {
+  if (outputIsRemote()) masterPost("/api/play-ack", "");
+  else playAckSound();
+}
+
+// Play the Home Assistant answer - locally, or on the master for a satellite.
+static bool turnPlayTts(const String &url) {
+  if (outputIsRemote()) return masterPost("/api/play-url", "{\"url\":\"" + jsonEscape(url) + "\"}");
+  return fetchAndPlayTtsUrl(url);
 }
 
 // One complete turn: open, stream, answer.
@@ -4846,7 +4910,7 @@ static bool runAssistStreamingTurn(bool playAck, bool bargeTurn) {
   // idles while the clip plays; the anchor then moves to just after it, so the
   // clip itself is never streamed to Home Assistant.
   if (bargeTurn && playAck) {
-    playAckSound();
+    turnPlayAck();
     bargeAnchorPos = bargeWritePos;
   }
 
@@ -4867,7 +4931,7 @@ static bool runAssistStreamingTurn(bool playAck, bool bargeTurn) {
   if (bargeTurn) srPauseDetection();
 
   // Non-barge acknowledgement plays after the connect, as it always has.
-  if (playAck && !bargeTurn) playAckSound();
+  if (playAck && !bargeTurn) turnPlayAck();
 
   if (!assistRecordAndStream(st, bargeTurn)) {
     uint8_t endFrame[1] = {(uint8_t)st.handlerId};
@@ -6221,6 +6285,13 @@ eine Änderung von Hand bleibt also bis zum nächsten Umschalten bestehen.
 <div class="pagehead"><h2>Mehrere VoiceDots</h2><div class="tag">Firmware <span class="fwtag">...</span></div></div>
 <section class="card full">
 <h2>MEHRERE VOICEDOTS</h2>
+<label>Rolle dieses Geräts</label>
+<select id="device_role">
+ <option value="0">Eigenständig (Mikrofon und Ausgabe)</option>
+ <option value="1">Satellit (nur Mikrofon, Ausgabe am Master)</option>
+ <option value="2">Master (Mikrofon und zentrale Ausgabe)</option>
+</select>
+<small class="help">Ein Satellit nimmt nur auf und schickt Ansage und Antwort an den Master, der sie abspielt. Der Master wird automatisch im Netz gefunden.</small>
 <div class="toggle">
  <input id="multi_enabled" type="checkbox" checked>
  <label for="multi_enabled" style="margin:0">Bei mehreren Geräten aushandeln, wer antwortet</label>
@@ -6592,6 +6663,7 @@ zurueckkommt.
 " $('auto_volume_max_db').value=j.auto_volume_max_db??10;\n"
 " $('autoVolLabel').textContent=$('auto_volume_max_db').value+' dB';\n"
 " $('multi_enabled').checked=j.multi_enabled!==false;\n"
+" $('device_role').value=String(j.device_role??0);\n"
 " $('multi_window_ms').value=j.multi_window_ms??220;\n"
 " $('multiLabel').textContent=$('multi_window_ms').value+' ms';\n"
 " $('wake_word').checked=j.wake_word!==false;\n"
@@ -6647,6 +6719,7 @@ zurueckkommt.
 " p.set('auto_volume',$('auto_volume').checked?'1':'0');\n"
 " p.set('auto_volume_max_db',$('auto_volume_max_db').value);\n"
 " p.set('multi_enabled',$('multi_enabled').checked?'1':'0');\n"
+" p.set('device_role',$('device_role').value);\n"
 " p.set('multi_window_ms',$('multi_window_ms').value);\n"
 " p.set('wake_word',$('wake_word').checked?'1':'0');\n"
 " p.set('wake_model',$('wake_model').value);\n"
@@ -7516,6 +7589,8 @@ void handleStatus() {
   json += "\"enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
   json += "\"ready\":" + String(multiReady ? "true" : "false") + ",";
   json += "\"id\":\"" + jsonEscape(multiOwnId()) + "\",";
+  json += "\"role\":" + String(cfg.deviceRole) + ",";
+  json += "\"master_ip\":\"" + jsonEscape(multiMasterIp()) + "\",";
   json += "\"window_ms\":" + String(cfg.multiWindowMs) + ",";
   json += "\"score\":" + String(multiWakeScore(), 1) + ",";
   json += "\"peak_db\":" + String(srRecentPeakDb, 1) + ",";
@@ -7619,6 +7694,7 @@ void handleGetConfig() {
   json += "\"multi_enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
   json += "\"multi_window_ms\":" + String(cfg.multiWindowMs) + ",";
   json += "\"barge_in\":" + String(cfg.bargeIn ? "true" : "false") + ",";
+  json += "\"device_role\":" + String(cfg.deviceRole) + ",";
   json += "\"hostname\":\"" + jsonEscape(deviceHostname()) + "\"";
   json += "}";
 
@@ -7792,6 +7868,11 @@ void handlePostConfig() {
 
   if (server.hasArg("barge_in")) {
     cfg.bargeIn = server.arg("barge_in") == "1" || server.arg("barge_in") == "true";
+  }
+
+  if (server.hasArg("device_role")) {
+    cfg.deviceRole = (uint8_t)constrain(server.arg("device_role").toInt(), 0, 2);
+    if (multiReady) multiSendHello();  // announce the new role right away
   }
 
   if (server.hasArg("clean_markdown")) {
@@ -8291,6 +8372,8 @@ static void multiHandleMessage(const String &msg, const IPAddress &from) {
     peer->ip = from.toString();
     String name = jsonFindString(msg, "name");
     if (name.length() > 0) peer->name = name;
+    String role = jsonFindString(msg, "role");
+    if (role.length() > 0) peer->role = (uint8_t)role.toInt();
   }
 
   if (type == "hello") return;
@@ -8342,6 +8425,7 @@ static void multiPoll() {
 static void multiSendHello() {
   String msg = "{\"t\":\"hello\",\"id\":\"" + multiOwnId() + "\"";
   msg += ",\"name\":\"" + jsonEscape(cfg.deviceName) + "\"";
+  msg += ",\"role\":\"" + String(cfg.deviceRole) + "\"";
   msg += ",\"fw\":\"" + String(FW_VERSION) + "\"}";
   multiBroadcast(msg);
 }
@@ -8349,10 +8433,24 @@ static void multiSendHello() {
 static void multiSendClaim(const char *type, float score) {
   String msg = "{\"t\":\"" + String(type) + "\",\"id\":\"" + multiOwnId() + "\"";
   msg += ",\"name\":\"" + jsonEscape(cfg.deviceName) + "\"";
+  msg += ",\"role\":\"" + String(cfg.deviceRole) + "\"";
   msg += ",\"score\":\"" + String(score, 1) + "\"";
   msg += ",\"peak\":\"" + String(srRecentPeakDb, 1) + "\"";
   msg += ",\"noise\":\"" + String(srRoomNoiseValid ? srRoomNoiseDb : -96.0f, 1) + "\"}";
   multiBroadcast(msg);
+}
+
+// The IP of the master on the network, or "" if none is known (or we are it).
+// A satellite sends its output there.
+static String multiMasterIp() {
+  for (uint8_t i = 0; i < multiPeerCount; i++) {
+    if (multiPeers[i].role == ROLE_MASTER &&
+        (uint32_t)(millis() - multiPeers[i].lastSeen) < MULTI_PEER_TTL_MS &&
+        multiPeers[i].ip.length() > 0) {
+      return multiPeers[i].ip;
+    }
+  }
+  return "";
 }
 
 static void multiBegin() {
@@ -10401,6 +10499,27 @@ void handleMute() {
   server.send(200, "application/json; charset=utf-8", json);
 }
 
+// A satellite asks the master to play the answer it got from Home Assistant.
+// The URL is fetched and played from loop(), never from here.
+void handleRemotePlayUrl() {
+  String url = server.hasArg("url") ? server.arg("url") : String("");
+  if (url.isEmpty() && server.hasArg("plain")) url = jsonFindString(server.arg("plain"), "url");
+  url.trim();
+  if (url.isEmpty()) {
+    server.send(400, "text/plain; charset=utf-8", "url fehlt.");
+    return;
+  }
+  remotePlayUrl = url;
+  remotePlayUrlReq = true;
+  server.send(200, "text/plain; charset=utf-8", "wird abgespielt");
+}
+
+// A satellite asks the master to play its acknowledgement clip.
+void handleRemoteAck() {
+  remoteAckReq = true;
+  server.send(200, "text/plain; charset=utf-8", "ack");
+}
+
 // Multipart upload of one sound file.
 void handleSoundUploadData() {
   HTTPUpload &upload = server.upload();
@@ -11319,6 +11438,8 @@ void setupWebServer() {
   server.on("/api/sound/upload", HTTP_POST, handleSoundUploadDone, handleSoundUploadData);
   server.on("/api/volume", HTTP_ANY, handleVolume);
   server.on("/api/mute", HTTP_ANY, handleMute);
+  server.on("/api/play-url", HTTP_ANY, handleRemotePlayUrl);
+  server.on("/api/play-ack", HTTP_ANY, handleRemoteAck);
   server.on("/api/ha/pipelines", HTTP_POST, handlePipelineRefresh);
   server.on("/api/ack/build", HTTP_POST, handleAckBuild);
   server.on("/api/ack/test", HTTP_POST, handleAckTest);
@@ -11628,6 +11749,27 @@ void loop() {
     srPauseDetection();
     setLedPhase(LED_PHASE_SPEAK);
     playSoundFile(name);
+    setLedPhase(LED_PHASE_IDLE);
+    srResumeDetection();
+  }
+
+  // Master plays what a satellite handed it. Detection is paused around playback
+  // so the master's own speaker cannot retrigger it.
+  if (remoteAckReq && !wakeBusy && !ttsPlaybackActive && !speakerTestActive) {
+    remoteAckReq = false;
+    srPauseDetection();
+    playAckSound();
+    setLedPhase(LED_PHASE_IDLE);
+    srResumeDetection();
+  }
+
+  if (remotePlayUrlReq && !wakeBusy && !ttsPlaybackActive && !speakerTestActive) {
+    remotePlayUrlReq = false;
+    String url = remotePlayUrl;
+    remotePlayUrl = "";
+    srPauseDetection();
+    setLedPhase(LED_PHASE_SPEAK);
+    fetchAndPlayTtsUrl(url);
     setLedPhase(LED_PHASE_IDLE);
     srResumeDetection();
   }
