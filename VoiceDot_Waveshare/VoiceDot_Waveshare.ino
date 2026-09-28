@@ -106,7 +106,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.14.2";
+static const char* FW_VERSION = "0.14.3";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -322,6 +322,11 @@ static constexpr float VAD_MIN_SPEECH_DB = -52.0f;
 static constexpr float VAD_NOISE_FLOOR_START_DB = -70.0f;
 static constexpr float VAD_NOISE_FLOOR_MAX_DB = -30.0f;
 static constexpr uint32_t VAD_CALIBRATE_MS = 180;
+// Speech onset must persist this many consecutive frames (128 samples = 8 ms
+// each) before it counts. A single-frame transient - a click, or the pop when
+// the amplifier switches off after the acknowledgement - is thrown away, while
+// the pre-roll still carries the true onset once it confirms.
+static constexpr uint8_t VAD_SPEECH_CONFIRM_FRAMES = 3;
 
 // Wake word.
 //
@@ -660,6 +665,7 @@ struct VadRec {
   float calibrationSum;
   uint32_t calibrationFrames;
   uint32_t voiceFrames;
+  uint16_t speechRun;      // consecutive above-threshold frames, for onset debounce
   bool needCalibration;
   uint8_t *preroll;
   size_t prerollFill;
@@ -4442,7 +4448,14 @@ static bool vadFeedFrame(AssistStream &st, VadRec &v,
     float threshold = v.noiseFloorDb + VAD_SPEECH_MARGIN_DB;
     if (threshold < VAD_MIN_SPEECH_DB) threshold = VAD_MIN_SPEECH_DB;
 
-    if (!calibrating && db > threshold) {
+    // Debounce the onset: a single loud frame (a click, or the amplifier pop
+    // after the acknowledgement) must not start a turn. Only a run of frames
+    // does. The not-yet-confirmed frames keep flowing into the pre-roll below,
+    // so the real opening syllable is still there when it confirms.
+    if (!calibrating && db > threshold) v.speechRun++;
+    else v.speechRun = 0;
+
+    if (v.speechRun >= VAD_SPEECH_CONFIRM_FRAMES) {
       v.speechStarted = true;
       v.speechStartedAt = now;
       v.lastVoiceMs = now;
@@ -4570,6 +4583,7 @@ static bool assistRecordAndStream(AssistStream &st, bool bargeTurn) {
   v.calibrationSum = 0.0f;
   v.calibrationFrames = 0;
   v.voiceFrames = 0;
+  v.speechRun = 0;
   v.needCalibration = true;
 
   bool haStopped = false;
