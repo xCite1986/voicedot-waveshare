@@ -106,7 +106,7 @@
 // Firmware
 // -----------------------------------------------------------------------------
 
-static const char* FW_VERSION = "0.13.6";
+static const char* FW_VERSION = "0.14.2";
 static const char* DEFAULT_HOSTNAME = "voicedot";
 static const char* AP_PASSWORD = "voicedot";
 
@@ -292,6 +292,15 @@ static constexpr uint32_t WAKE_PREROLL_MS = 320;
 static constexpr uint32_t WAKE_MAX_BYTES = (AUDIO_SAMPLE_RATE * 2 * WAKE_MAX_RECORD_MS) / 1000;
 static constexpr uint32_t WAKE_PREROLL_BYTES = (AUDIO_SAMPLE_RATE * 2 * WAKE_PREROLL_MS) / 1000;
 
+// Barge-in: the feed task keeps a rolling mono buffer of the most recent audio
+// so a turn can begin with everything spoken from the moment of the wake word,
+// including whatever was said while the WebSocket was still connecting. Mono at
+// AUDIO_SAMPLE_RATE, so one sample is two bytes.
+static constexpr uint32_t BARGE_RING_MS = 2600;
+static constexpr uint32_t BARGE_LOOKBACK_MS = 200;  // grab a little before detection
+static constexpr size_t BARGE_RING_SAMPLES = (size_t)(AUDIO_SAMPLE_RATE * BARGE_RING_MS) / 1000;
+static constexpr size_t BARGE_LOOKBACK_SAMPLES = (size_t)(AUDIO_SAMPLE_RATE * BARGE_LOOKBACK_MS) / 1000;
+
 // Voice activity detection. The noise floor is tracked while the recorder is
 // waiting for speech, so a noisy room raises the threshold instead of
 // triggering immediately.
@@ -445,6 +454,16 @@ float srRoomNoiseDb = VAD_NOISE_FLOOR_START_DB;
 uint32_t srRoomNoiseAt = 0;
 bool srRoomNoiseValid = false;
 String srStatus = "nicht gestartet";
+
+// Barge-in rolling capture. The feed task appends mono samples here whenever it
+// reads the microphone; the recorder drains it at the start of a turn. Written
+// only by the feed task and read only after srPauseDetection() has confirmed
+// that task idle, so no lock is needed.
+int16_t *bargeRing = nullptr;
+volatile size_t bargeWritePos = 0;   // next sample slot, wraps at BARGE_RING_SAMPLES
+volatile size_t bargeFillCount = 0;  // valid samples so far, saturates at capacity
+size_t bargeAnchorPos = 0;           // where the recorder starts draining: just
+                                     // after the wake word, or after the ack clip
 
 // Wake word models found in the partition, and the one currently loaded.
 // Assist pipelines as reported by Home Assistant. Each pipeline carries its own
@@ -627,6 +646,26 @@ struct AssistStream {
   bool failed = false;
 };
 
+// Everything the per-frame voice-activity logic carries between frames. Defined
+// up here with the other types so the sketch's auto-generated prototypes, which
+// land above the function bodies, already know it.
+struct VadRec {
+  bool speechStarted;
+  uint32_t started;
+  uint32_t speechStartedAt;
+  uint32_t lastVoiceMs;
+  float noiseFloorDb;
+  float speechPeakDb;
+  float lastRelease;
+  float calibrationSum;
+  uint32_t calibrationFrames;
+  uint32_t voiceFrames;
+  bool needCalibration;
+  uint8_t *preroll;
+  size_t prerollFill;
+  size_t prerollHead;
+};
+
 // -----------------------------------------------------------------------------
 // Serial log mirror
 //
@@ -790,6 +829,7 @@ struct Config {
   uint8_t autoVolumeMaxDb; // how far it may lift it
   bool multiEnabled;    // arbitrate the wake word with other VoiceDots
   uint16_t multiWindowMs; // how long to wait for competing claims
+  bool bargeIn;         // capture continuously so one can talk over the wake word
 };
 
 Config cfg;
@@ -1429,6 +1469,7 @@ void loadConfig() {
   cfg.autoVolumeMaxDb = constrain(prefs.getUChar("avol_max", 10), 0, 18);
   cfg.multiEnabled = prefs.getBool("multi_on", true);
   cfg.multiWindowMs = constrain(prefs.getUShort("multi_win", 220), 80, 600);
+  cfg.bargeIn = prefs.getBool("barge_in", false);
   cfg.timezone = prefs.getString("tz", DEFAULT_TIMEZONE);
   if (cfg.timezone.isEmpty()) cfg.timezone = DEFAULT_TIMEZONE;
   cfg.ackPhrases = prefs.getString("ack_phrases", ACK_DEFAULT_PHRASES);
@@ -1491,6 +1532,7 @@ void saveConfig() {
   prefs.putUChar("avol_max", cfg.autoVolumeMaxDb);
   prefs.putBool("multi_on", cfg.multiEnabled);
   prefs.putUShort("multi_win", cfg.multiWindowMs);
+  prefs.putBool("barge_in", cfg.bargeIn);
   prefs.putString("tz", cfg.timezone);
   prefs.putString("ack_phrases", cfg.ackPhrases);
   prefs.putString("ha_tts_eng", haTtsEngine);
@@ -1709,11 +1751,20 @@ bool codecUpdate(uint8_t address, uint8_t reg, uint8_t mask, uint8_t value) {
 // out, so the top of the scale is capped: what the interface calls 100 % is
 // four fifths of what the chip could do, and nothing goes above it - the
 // ambient boost included.
-static constexpr uint8_t ES8311_REG_CEILING = 209;  // 80 % of the full 32..255
+static constexpr uint8_t ES8311_REG_CEILING = 209;  // 80 % of the full 32..255,
+                                                    // the hardware/boost ceiling
+
+// On this speaker the codec stays inaudible below roughly the old 40 % setting
+// and gets uncomfortably loud past the old 80 %. So the whole 1..100 % scale is
+// mapped onto just that usable band: what used to need level 4 is now the bottom
+// of the scale, and level 8 is now the top. 0 still means silence. These two
+// register values are the old reg(40 %) and reg(80 %) of the 32..209 mapping.
+static constexpr uint8_t ES8311_REG_USABLE_MIN = 101;  // was ~level 4 (40 %)
+static constexpr uint8_t ES8311_REG_USABLE_MAX = 173;  // was ~level 8 (80 %)
 
 uint8_t es8311VolumeReg(uint8_t percent) {
   if (percent == 0) return 0x00;
-  return map(percent, 1, 100, 32, ES8311_REG_CEILING);
+  return map(percent, 1, 100, ES8311_REG_USABLE_MIN, ES8311_REG_USABLE_MAX);
 }
 
 // A boost in decibels is just an offset on the volume register - going through
@@ -2313,6 +2364,20 @@ static void srFeedTask(void *arg) {
     }
     uint32_t t2 = millis();
     if (t2 - t1 > srMaxMeterMs) srMaxMeterMs = t2 - t1;
+
+    // Keep the rolling barge-in buffer fed with mono, taken from the raw two
+    // microphone channels before they are spread out for the AFE below. This is
+    // the only writer; the recorder reads it only after the feed task has gone
+    // idle, so there is no race.
+    if (bargeRing && cfg.bargeIn) {
+      size_t rawSamples = got / sizeof(int16_t);
+      for (size_t i = 0; i + 1 < rawSamples; i += SR_RX_CHANNELS) {
+        int16_t m = (int16_t)(((int32_t)buf[i] + (int32_t)buf[i + 1]) / 2);
+        bargeRing[bargeWritePos] = m;
+        bargeWritePos = (bargeWritePos + 1) % BARGE_RING_SAMPLES;
+        if (bargeFillCount < BARGE_RING_SAMPLES) bargeFillCount++;
+      }
+    }
 
     // Spread our channels out if the AFE wants more than the microphone gives.
     if (feedChannels > SR_RX_CHANNELS) {
@@ -4341,21 +4406,128 @@ static bool assistOpen(AssistStream &st, Client *client) {
   return false;
 }
 
+// Processes one mono frame: level, noise-floor tracking, speech onset with the
+// pre-roll, streaming, and the silence-based end. `now` is this frame's
+// timestamp - real time for the live microphone, a synthetic clock while the
+// barge-in buffer is drained so the silence timing stays coherent. Returns true
+// when the utterance should end on trailing silence.
+static bool vadFeedFrame(AssistStream &st, VadRec &v,
+                         const int16_t *mono, size_t monoSamples, uint32_t now) {
+  uint32_t elapsed = now - v.started;
+  size_t monoBytes = monoSamples * sizeof(int16_t);
+  int16_t peak = 0;
+  float db = frameLevelDb(mono, monoSamples, &peak);
+
+  micPeak = peak;
+  micDb = db;
+  micLevel = constrain((int)map(peak, 0, 4000, 0, 100), 0, 100);
+  micReadCount++;
+
+  bool calibrating = v.needCalibration && !v.speechStarted &&
+                     (elapsed < VAD_CALIBRATE_MS || v.calibrationFrames < 4);
+  if (calibrating) {
+    v.calibrationSum += db;
+    v.calibrationFrames++;
+    v.noiseFloorDb = v.calibrationSum / (float)v.calibrationFrames;
+  } else if (db < v.noiseFloorDb) {
+    v.noiseFloorDb += (db - v.noiseFloorDb) * 0.25f;
+  } else {
+    v.noiseFloorDb += (db - v.noiseFloorDb) * 0.002f;
+  }
+
+  if (v.noiseFloorDb > VAD_NOISE_FLOOR_MAX_DB) v.noiseFloorDb = VAD_NOISE_FLOOR_MAX_DB;
+  wakeNoiseFloorDb = v.noiseFloorDb;
+
+  if (!v.speechStarted) {
+    float threshold = v.noiseFloorDb + VAD_SPEECH_MARGIN_DB;
+    if (threshold < VAD_MIN_SPEECH_DB) threshold = VAD_MIN_SPEECH_DB;
+
+    if (!calibrating && db > threshold) {
+      v.speechStarted = true;
+      v.speechStartedAt = now;
+      v.lastVoiceMs = now;
+      wakeLastState = "recording";
+      wakeLastMessage = "Aufnahme läuft.";
+      diagLogf("WAKE_REC", "speech start db=%d floor=%d after=%lu",
+               (int)db, (int)v.noiseFloorDb, (unsigned long)elapsed);
+
+      // The pre-roll goes out first so the opening syllable is not lost.
+      if (v.preroll && v.prerollFill > 0) {
+        size_t oldest = v.prerollFill < WAKE_PREROLL_BYTES ? 0 : v.prerollHead;
+        assistWrite(st, v.preroll + oldest, v.prerollFill - oldest);
+        if (oldest > 0) assistWrite(st, v.preroll, oldest);
+      }
+
+      assistWrite(st, (const uint8_t*)mono, monoBytes);
+    } else if (v.preroll) {
+      size_t remaining = monoBytes;
+      const uint8_t *src = (const uint8_t*)mono;
+      while (remaining > 0) {
+        size_t chunk = min<size_t>(remaining, WAKE_PREROLL_BYTES - v.prerollHead);
+        memcpy(v.preroll + v.prerollHead, src, chunk);
+        v.prerollHead = (v.prerollHead + chunk) % WAKE_PREROLL_BYTES;
+        src += chunk;
+        remaining -= chunk;
+        if (v.prerollFill < WAKE_PREROLL_BYTES) {
+          v.prerollFill = min<size_t>(WAKE_PREROLL_BYTES, v.prerollFill + chunk);
+        }
+      }
+    }
+  } else {
+    assistWrite(st, (const uint8_t*)mono, monoBytes);
+
+    if (db > v.speechPeakDb) v.speechPeakDb = db;
+    else v.speechPeakDb = v.speechPeakDb * 0.999f + db * 0.001f;
+
+    float release = v.speechPeakDb - VAD_SPEECH_DROP_DB;
+    float floorGuard = v.noiseFloorDb + (float)cfg.vadReleaseDb;
+    if (release < floorGuard) release = floorGuard;
+    v.lastRelease = release;
+
+    if (db > release) {
+      v.voiceFrames++;
+
+      // Move the silence clock back instead of zeroing it, so a single noise
+      // spike cannot erase a second of accumulated quiet.
+      uint32_t accumulated = now - v.lastVoiceMs;
+      v.lastVoiceMs += min<uint32_t>(accumulated, VAD_BLIP_CREDIT_MS);
+    }
+
+    if (cfg.vadEnabled) {
+      wakeLastVadSilenceMs = now - v.lastVoiceMs;
+      uint32_t spoken = now - v.speechStartedAt;
+      if (wakeLastVadSilenceMs >= cfg.vadSilenceMs && spoken >= WAKE_MIN_RECORD_MS) {
+        diagLogf("WAKE_REC", "silence stop spoken=%lu silence=%lu voice=%lu peak=%d rel=%d",
+                 (unsigned long)spoken,
+                 (unsigned long)wakeLastVadSilenceMs,
+                 (unsigned long)v.voiceFrames,
+                 (int)v.speechPeakDb,
+                 (int)release);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // Records with VAD and streams every frame as it arrives. Returns false when
-// nothing was spoken or the stream broke.
-static bool assistRecordAndStream(AssistStream &st) {
+// nothing was spoken or the stream broke. On a barge-in turn the rolling buffer
+// captured since the wake word is drained first, so audio spoken immediately -
+// even while the WebSocket was still connecting - is not lost.
+static bool assistRecordAndStream(AssistStream &st, bool bargeTurn) {
   if (!audioI2sReady || !codecRecordReady) {
     wakeLastMessage = "Mikrofon ist nicht bereit.";
     diagLog("WAKE_REC", wakeLastMessage);
     return false;
   }
 
-  uint8_t *preroll = nullptr;
-  size_t prerollFill = 0;
-  size_t prerollHead = 0;
+  VadRec v;
+  v.preroll = nullptr;
+  v.prerollFill = 0;
+  v.prerollHead = 0;
   if (cfg.vadEnabled) {
-    preroll = (uint8_t*)malloc(WAKE_PREROLL_BYTES);
-    if (!preroll) diagLog("WAKE_REC", "pre-roll buffer unavailable, continuing without it");
+    v.preroll = (uint8_t*)malloc(WAKE_PREROLL_BYTES);
+    if (!v.preroll) diagLog("WAKE_REC", "pre-roll buffer unavailable, continuing without it");
   }
 
   wakeRecording = true;
@@ -4367,39 +4539,84 @@ static bool assistRecordAndStream(AssistStream &st) {
   int16_t stereo[AUDIO_FRAME_SAMPLES * 2];
   int16_t mono[AUDIO_FRAME_SAMPLES];
   size_t bytesRead = 0;
-  for (uint8_t i = 0; i < 24; i++) {
-    if (audioRead(stereo, sizeof(stereo), &bytesRead, 0) != ESP_OK || bytesRead == 0) break;
-  }
 
-  const uint32_t started = millis();
-  uint32_t lastLog = started;
-  uint32_t lastVoiceMs = started;
-  uint32_t speechStartedAt = started;
-  bool speechStarted = !cfg.vadEnabled;
-  float noiseFloorDb = VAD_NOISE_FLOOR_START_DB;
-  float speechPeakDb = -96.0f;
-  float lastRelease = -96.0f;
-  float calibrationSum = 0.0f;
-  uint32_t calibrationFrames = 0;
-  uint32_t voiceFrames = 0;
+  const uint32_t now0 = millis();
+
+  // Barge-in: the feed task has gone idle (srPauseDetection confirmed it), so
+  // bargeWritePos is stable. Drain everything from the anchor - set just after
+  // the wake word, or just after the acknowledgement clip - to now, capped by
+  // what the ring actually holds.
+  size_t bargeSamples = 0;
+  if (bargeTurn && bargeRing) {
+    size_t want = (bargeWritePos + BARGE_RING_SAMPLES - bargeAnchorPos) % BARGE_RING_SAMPLES;
+    if (want > bargeFillCount) want = bargeFillCount;
+    if (want > BARGE_RING_SAMPLES) want = BARGE_RING_SAMPLES;
+    bargeSamples = want;
+  }
+  uint32_t bargeMs = (uint32_t)((uint64_t)bargeSamples * 1000ULL / AUDIO_SAMPLE_RATE);
+
+  // The drained audio is in the past, so the clock starts that far back and each
+  // drained frame carries a synthetic timestamp.
+  const uint32_t started = bargeMs > 0 ? (now0 - bargeMs) : now0;
+  uint32_t lastLog = now0;
+
+  v.speechStarted = !cfg.vadEnabled;
+  v.started = started;
+  v.speechStartedAt = started;
+  v.lastVoiceMs = started;
+  v.noiseFloorDb = VAD_NOISE_FLOOR_START_DB;
+  v.speechPeakDb = -96.0f;
+  v.lastRelease = -96.0f;
+  v.calibrationSum = 0.0f;
+  v.calibrationFrames = 0;
+  v.voiceFrames = 0;
+  v.needCalibration = true;
+
   bool haStopped = false;
   bool haError = false;
 
-  bool needCalibration = true;
-  if (srRoomNoiseValid && (uint32_t)(started - srRoomNoiseAt) < SR_ROOM_NOISE_TTL_MS) {
-    noiseFloorDb = srRoomNoiseDb;
-    needCalibration = false;
-    diagLogf("WAKE_REC", "noise floor seeded from detector: %d dBFS", (int)noiseFloorDb);
+  if (srRoomNoiseValid && (uint32_t)(now0 - srRoomNoiseAt) < SR_ROOM_NOISE_TTL_MS) {
+    v.noiseFloorDb = srRoomNoiseDb;
+    v.needCalibration = false;
+    diagLogf("WAKE_REC", "noise floor seeded from detector: %d dBFS", (int)v.noiseFloorDb);
+  }
+
+  if (bargeSamples > 0) {
+    diagLogf("WAKE_REC", "barge-in: draining %lu ms (%u samples)",
+             (unsigned long)bargeMs, (unsigned)bargeSamples);
+    size_t pos = (bargeWritePos + BARGE_RING_SAMPLES - bargeSamples) % BARGE_RING_SAMPLES;
+    size_t left = bargeSamples;
+    size_t frameIndex = 0;
+    while (left > 0) {
+      size_t n = min<size_t>(left, AUDIO_FRAME_SAMPLES);
+      for (size_t i = 0; i < n; i++) {
+        mono[i] = bargeRing[pos];
+        pos = (pos + 1) % BARGE_RING_SAMPLES;
+      }
+      uint32_t synthNow = started +
+        (uint32_t)((uint64_t)frameIndex * AUDIO_FRAME_SAMPLES * 1000ULL / AUDIO_SAMPLE_RATE);
+      if (vadFeedFrame(st, v, mono, n, synthNow)) { haStopped = true; break; }
+      left -= n;
+      frameIndex++;
+    }
+  }
+
+  // Prime by dropping stale frames the codec buffered while it was idle - but
+  // not on a barge-in turn, where those frames are the continuation of speech.
+  if (!bargeTurn) {
+    for (uint8_t i = 0; i < 24; i++) {
+      if (audioRead(stereo, sizeof(stereo), &bytesRead, 0) != ESP_OK || bytesRead == 0) break;
+    }
   }
 
   while (true) {
     uint32_t now = millis();
     uint32_t elapsed = now - started;
 
-    if (!speechStarted && elapsed > WAKE_SPEECH_TIMEOUT_MS) break;
-    if (speechStarted && !cfg.vadEnabled && elapsed >= WAKE_RECORD_MS) break;
-    if (speechStarted && cfg.vadEnabled &&
-        (uint32_t)(now - speechStartedAt) >= WAKE_MAX_RECORD_MS) {
+    if (!v.speechStarted && elapsed > WAKE_SPEECH_TIMEOUT_MS) break;
+    if (v.speechStarted && !cfg.vadEnabled && elapsed >= WAKE_RECORD_MS) break;
+    if (v.speechStarted && cfg.vadEnabled &&
+        (uint32_t)(now - v.speechStartedAt) >= WAKE_MAX_RECORD_MS) {
       diagLog("WAKE_REC", "max length reached");
       break;
     }
@@ -4417,105 +4634,13 @@ static bool assistRecordAndStream(AssistStream &st) {
         mono[monoSamples++] = (int16_t)(((int32_t)stereo[i] + (int32_t)stereo[i + 1]) / 2);
       }
 
-      size_t monoBytes = monoSamples * sizeof(int16_t);
-      int16_t peak = 0;
-      float db = frameLevelDb(mono, monoSamples, &peak);
-
-      micPeak = peak;
-      micDb = db;
-      micLevel = constrain((int)map(peak, 0, 4000, 0, 100), 0, 100);
-      micReadCount++;
       micLastBytes = bytesRead;
-
-      bool calibrating = needCalibration && !speechStarted &&
-                         (elapsed < VAD_CALIBRATE_MS || calibrationFrames < 4);
-      if (calibrating) {
-        calibrationSum += db;
-        calibrationFrames++;
-        noiseFloorDb = calibrationSum / (float)calibrationFrames;
-      } else if (db < noiseFloorDb) {
-        noiseFloorDb += (db - noiseFloorDb) * 0.25f;
-      } else {
-        noiseFloorDb += (db - noiseFloorDb) * 0.002f;
-      }
-
-      if (noiseFloorDb > VAD_NOISE_FLOOR_MAX_DB) noiseFloorDb = VAD_NOISE_FLOOR_MAX_DB;
-      wakeNoiseFloorDb = noiseFloorDb;
-
-      if (!speechStarted) {
-        float threshold = noiseFloorDb + VAD_SPEECH_MARGIN_DB;
-        if (threshold < VAD_MIN_SPEECH_DB) threshold = VAD_MIN_SPEECH_DB;
-
-        if (!calibrating && db > threshold) {
-          speechStarted = true;
-          speechStartedAt = now;
-          lastVoiceMs = now;
-          wakeLastState = "recording";
-          wakeLastMessage = "Aufnahme läuft.";
-          diagLogf("WAKE_REC", "speech start db=%d floor=%d after=%lu",
-                   (int)db, (int)noiseFloorDb, (unsigned long)elapsed);
-
-          // The pre-roll goes out first so the opening syllable is not lost.
-          if (preroll && prerollFill > 0) {
-            size_t oldest = prerollFill < WAKE_PREROLL_BYTES ? 0 : prerollHead;
-            assistWrite(st, preroll + oldest, prerollFill - oldest);
-            if (oldest > 0) assistWrite(st, preroll, oldest);
-          }
-
-          assistWrite(st, (const uint8_t*)mono, monoBytes);
-        } else if (preroll) {
-          size_t remaining = monoBytes;
-          const uint8_t *src = (const uint8_t*)mono;
-          while (remaining > 0) {
-            size_t chunk = min<size_t>(remaining, WAKE_PREROLL_BYTES - prerollHead);
-            memcpy(preroll + prerollHead, src, chunk);
-            prerollHead = (prerollHead + chunk) % WAKE_PREROLL_BYTES;
-            src += chunk;
-            remaining -= chunk;
-            if (prerollFill < WAKE_PREROLL_BYTES) {
-              prerollFill = min<size_t>(WAKE_PREROLL_BYTES, prerollFill + chunk);
-            }
-          }
-        }
-      } else {
-        assistWrite(st, (const uint8_t*)mono, monoBytes);
-
-        if (db > speechPeakDb) speechPeakDb = db;
-        else speechPeakDb = speechPeakDb * 0.999f + db * 0.001f;
-
-        float release = speechPeakDb - VAD_SPEECH_DROP_DB;
-        float floorGuard = noiseFloorDb + (float)cfg.vadReleaseDb;
-        if (release < floorGuard) release = floorGuard;
-        lastRelease = release;
-
-        if (db > release) {
-          voiceFrames++;
-
-          // Move the silence clock back instead of zeroing it, so a single
-          // noise spike cannot erase a second of accumulated quiet.
-          uint32_t accumulated = now - lastVoiceMs;
-          lastVoiceMs += min<uint32_t>(accumulated, VAD_BLIP_CREDIT_MS);
-        }
-
-        if (cfg.vadEnabled) {
-          wakeLastVadSilenceMs = now - lastVoiceMs;
-          uint32_t spoken = now - speechStartedAt;
-          if (wakeLastVadSilenceMs >= cfg.vadSilenceMs && spoken >= WAKE_MIN_RECORD_MS) {
-            diagLogf("WAKE_REC", "silence stop spoken=%lu silence=%lu voice=%lu peak=%d rel=%d",
-                     (unsigned long)spoken,
-                     (unsigned long)wakeLastVadSilenceMs,
-                     (unsigned long)voiceFrames,
-                     (int)speechPeakDb,
-                     (int)release);
-            break;
-          }
-        }
-      }
+      if (vadFeedFrame(st, v, mono, monoSamples, now)) break;
     }
 
     // Keep the socket drained: Home Assistant reports stt-start, VAD events and
     // errors while we are still sending.
-    if (speechStarted && assistPollEvents(st, haError)) haStopped = true;
+    if (v.speechStarted && assistPollEvents(st, haError)) haStopped = true;
 
     pumpServices();
     ledTick();
@@ -4525,23 +4650,23 @@ static bool assistRecordAndStream(AssistStream &st) {
       diagLogf("WAKE_REC", "streaming sent=%lu db=%d floor=%d rel=%d silence=%lu",
                (unsigned long)wakeLastBytes,
                (int)micDb,
-               (int)noiseFloorDb,
-               (int)lastRelease,
+               (int)v.noiseFloorDb,
+               (int)v.lastRelease,
                (unsigned long)wakeLastVadSilenceMs);
     }
   }
 
-  if (preroll) free(preroll);
+  if (v.preroll) free(v.preroll);
 
   assistFlush(st);
 
   wakeRecording = false;
   wakeLastDurationMs = millis() - started;
 
-  if (!speechStarted) {
+  if (!v.speechStarted) {
     wakeLastMessage = "Nichts gehört. Bitte direkt nach dem Tastendruck sprechen.";
     diagLogf("WAKE_REC", "no speech floor=%d duration=%lu",
-             (int)noiseFloorDb, (unsigned long)wakeLastDurationMs);
+             (int)v.noiseFloorDb, (unsigned long)wakeLastDurationMs);
     return false;
   }
 
@@ -4553,9 +4678,9 @@ static bool assistRecordAndStream(AssistStream &st) {
   diagLogf("WAKE_REC", "done sent=%lu duration=%lu voice=%lu floor=%d rel=%d",
            (unsigned long)wakeLastBytes,
            (unsigned long)wakeLastDurationMs,
-           (unsigned long)voiceFrames,
-           (int)noiseFloorDb,
-           (int)lastRelease);
+           (unsigned long)v.voiceFrames,
+           (int)v.noiseFloorDb,
+           (int)v.lastRelease);
   return true;
 }
 
@@ -4687,7 +4812,7 @@ static bool assistFinish(AssistStream &st) {
 }
 
 // One complete turn: open, stream, answer.
-static bool runAssistStreamingTurn(bool playAck) {
+static bool runAssistStreamingTurn(bool playAck, bool bargeTurn) {
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
 
@@ -4702,9 +4827,19 @@ static bool runAssistStreamingTurn(bool playAck) {
 
   AssistStream st;
 
-  // Opening the pipeline first costs about half a second. Doing it before the
-  // acknowledgement hides that behind a sound the user is listening to anyway.
+  // Barge-in plays the acknowledgement up front, before the connect, so it is
+  // heard right away - that is what makes it feel responsive. The rolling buffer
+  // idles while the clip plays; the anchor then moves to just after it, so the
+  // clip itself is never streamed to Home Assistant.
+  if (bargeTurn && playAck) {
+    playAckSound();
+    bargeAnchorPos = bargeWritePos;
+  }
+
+  // Opening the pipeline first costs about half a second. For a non-barge turn
+  // the acknowledgement below hides that behind a sound the user hears anyway.
   if (!assistOpen(st, client)) {
+    if (bargeTurn) srPauseDetection();  // the caller left it running for the ring
     client->stop();
     wakeSending = false;
     return false;
@@ -4712,9 +4847,15 @@ static bool runAssistStreamingTurn(bool playAck) {
 
   wakeSending = false;
 
-  if (playAck) playAckSound();
+  // Barge-in kept the detector (and its rolling buffer) running through the
+  // connect above. Take the microphone now, right before recording, so the ring
+  // holds everything spoken since the acknowledgement finished.
+  if (bargeTurn) srPauseDetection();
 
-  if (!assistRecordAndStream(st)) {
+  // Non-barge acknowledgement plays after the connect, as it always has.
+  if (playAck && !bargeTurn) playAckSound();
+
+  if (!assistRecordAndStream(st, bargeTurn)) {
     uint8_t endFrame[1] = {(uint8_t)st.handlerId};
     if (!st.failed) wsSendFrame(*st.client, 0x2, endFrame, 1);
     client->stop();
@@ -4742,7 +4883,26 @@ void runWakeCaptureAndHa() {
 
   diagLogf("WAKE", "start source=%s", wakeRequestSource);
   wakeBusy = true;
-  srPauseDetection();
+
+  // No confirmation on a follow-up turn: the assistant just asked something,
+  // answering it with "Ja bitte" would talk over its own question.
+  bool isFollowUpTurn = strcmp(wakeRequestSource, "continue_conversation") == 0;
+
+  // Barge-in only makes sense when the detector is actually running and filling
+  // the rolling buffer. On a follow-up the detector is already paused, so the
+  // normal path (which starts listening at once) is used.
+  bool bargeTurn = cfg.bargeIn && bargeRing && srRunning && !srPaused && !isFollowUpTurn;
+
+  if (bargeTurn) {
+    // Keep the detector running so the ring keeps filling through the connect.
+    // Anchor the capture a touch before now; if an ack clip plays, the anchor is
+    // moved to just after it (inside the turn) so the clip is not sent to HA.
+    size_t lookback = min((size_t)bargeFillCount, (size_t)BARGE_LOOKBACK_SAMPLES);
+    bargeAnchorPos = (bargeWritePos + BARGE_RING_SAMPLES - lookback) % BARGE_RING_SAMPLES;
+  } else {
+    srPauseDetection();
+  }
+
   radioPauseForTurn();
   wakeLastState = "wake";
   wakeLastMessage = "Wake erkannt.";
@@ -4751,12 +4911,11 @@ void runWakeCaptureAndHa() {
   wakeTtsUrl = "";
   wakeTtsStatus = "-";
 
-  // No confirmation on a follow-up turn: the assistant just asked something,
-  // answering it with "Ja bitte" would talk over its own question.
-  bool isFollowUpTurn = strcmp(wakeRequestSource, "continue_conversation") == 0;
+  // The acknowledgement plays in a barge-in turn too now - but up front, and the
+  // recorder skips its window so it never reaches the recogniser.
   bool playAck = cfg.ackEnabled && !isFollowUpTurn;
 
-  bool ok = runAssistStreamingTurn(playAck);
+  bool ok = runAssistStreamingTurn(playAck, bargeTurn);
 
   if (!ok && wakeLastState != "error" && wakeLastState != "partial") wakeLastState = "error";
 
@@ -5654,6 +5813,11 @@ auch für die Anhebung nach Umgebungslärm.
  <input id="vad" type="checkbox" checked>
  <label for="vad" style="margin:0">Aufnahme automatisch beenden, wenn ich aufhöre zu sprechen</label>
 </div>
+<div class="toggle">
+ <input id="barge_in" type="checkbox">
+ <label for="barge_in" style="margin:0">Sofort weitersprechen (Barge-in): direkt nach dem Stichwort reden, ohne auf eine Ansage zu warten</label>
+</div>
+<small class="help">Nimmt durchgehend mit, damit nichts verloren geht. Die Ansage („Ja bitte?") kommt sofort und wird aus der Aufnahme herausgehalten; direkt danach sprechen wird vollständig erfasst. Braucht das lokale Wake-Word.</small>
 
 <div class="row">
  <div>
@@ -6391,6 +6555,7 @@ zurueckkommt.
 " $('ha_url').value=j.ha_url||'';\n"
 " $('ha_pipeline').value=j.ha_pipeline||'';\n"
 " $('vad').checked=j.vad!==false;\n"
+" $('barge_in').checked=j.barge_in===true;\n"
 " $('vad_release_db').value=j.vad_release_db??8;\n"
 " $('relLabel').textContent=$('vad_release_db').value+' dB';\n"
 " $('vad_silence_ms').value=j.vad_silence_ms??1400;\n"
@@ -6453,6 +6618,7 @@ zurueckkommt.
 " p.set('ha_token',$('ha_token').value);\n"
 " p.set('ha_pipeline',$('ha_pipeline').value);\n"
 " p.set('vad',$('vad').checked?'1':'0');\n"
+" p.set('barge_in',$('barge_in').checked?'1':'0');\n"
 " p.set('vad_release_db',$('vad_release_db').value);\n"
 " p.set('vad_silence_ms',$('vad_silence_ms').value);\n"
 " p.set('follow_up',$('follow_up').checked?'1':'0');\n"
@@ -7438,6 +7604,7 @@ void handleGetConfig() {
   json += "\"auto_volume_max_db\":" + String(cfg.autoVolumeMaxDb) + ",";
   json += "\"multi_enabled\":" + String(cfg.multiEnabled ? "true" : "false") + ",";
   json += "\"multi_window_ms\":" + String(cfg.multiWindowMs) + ",";
+  json += "\"barge_in\":" + String(cfg.bargeIn ? "true" : "false") + ",";
   json += "\"hostname\":\"" + jsonEscape(deviceHostname()) + "\"";
   json += "}";
 
@@ -7607,6 +7774,10 @@ void handlePostConfig() {
 
   if (server.hasArg("multi_window_ms")) {
     cfg.multiWindowMs = constrain(server.arg("multi_window_ms").toInt(), 80, 600);
+  }
+
+  if (server.hasArg("barge_in")) {
+    cfg.bargeIn = server.arg("barge_in") == "1" || server.arg("barge_in") == "true";
   }
 
   if (server.hasArg("clean_markdown")) {
@@ -11190,6 +11361,13 @@ void setup() {
 
   Serial.println("BOOT: load config");
   loadConfig();
+
+  // Rolling capture buffer for barge-in, in PSRAM. If it cannot be had, barge-in
+  // simply never engages and the normal wake flow is used.
+  bargeRing = (int16_t*)ps_malloc(BARGE_RING_SAMPLES * sizeof(int16_t));
+  Serial.printf("BOOT: barge-in ring %s (%u samples)\n",
+                bargeRing ? "ready" : "unavailable",
+                (unsigned)BARGE_RING_SAMPLES);
 
   // Detect the exact Waveshare audio hardware first.
   Serial.println("BOOT: detect board");
